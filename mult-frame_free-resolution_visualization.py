@@ -157,6 +157,20 @@ def load_cameras_from_json(json_path):
     return cameras
 
 
+def get_available_ram_bytes():
+    meminfo_path = "/proc/meminfo"
+    try:
+        with open(meminfo_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
 def focal2fov(focal, pixels):
     """将焦距转换为视场角"""
     return 2 * math.atan(pixels / (2 * focal))
@@ -376,6 +390,15 @@ PLY_NUMPY_DTYPES = {
 }
 
 PLAYER_SEQUENCE_CACHE_VERSION = 1
+PLAYER_SEQUENCE_PACKED_CACHE_VERSION = 1
+PLAYER_SEQUENCE_PACKED_META_NAME = "packed_meta.json"
+PLAYER_SEQUENCE_PACKED_FILE_NAMES = {
+    "xyz": "packed_xyz.bin",
+    "features": "packed_features.bin",
+    "scaling": "packed_scaling.bin",
+    "rotation": "packed_rotation.bin",
+    "opacity": "packed_opacity.bin",
+}
 
 
 def fast_load_ply_vertex_table(path):
@@ -450,6 +473,67 @@ def load_sequence_cache_metadata(cache_dir):
         return json.load(f)
 
 
+def load_packed_sequence_cache_metadata(cache_dir):
+    meta_path = os.path.join(cache_dir, PLAYER_SEQUENCE_PACKED_META_NAME)
+    if not os.path.exists(meta_path):
+        return None
+    with open(meta_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _packed_cache_file_paths(cache_dir, meta=None):
+    file_names = dict(PLAYER_SEQUENCE_PACKED_FILE_NAMES)
+    if meta and isinstance(meta.get("file_names"), dict):
+        file_names.update(meta["file_names"])
+    return {key: os.path.join(cache_dir, name) for key, name in file_names.items()}
+
+
+def is_packed_sequence_cache_compatible(meta, sequence_dir, frame_files, sh_degree, max_gaussians):
+    if not meta:
+        return False
+    if int(meta.get("packed_version", -1)) != PLAYER_SEQUENCE_PACKED_CACHE_VERSION:
+        return False
+    if os.path.abspath(meta.get("source_dir", "")) != os.path.abspath(sequence_dir):
+        return False
+    if int(meta.get("sh_degree", -1)) != int(sh_degree):
+        return False
+    meta_max_gaussians = meta.get("max_gaussians")
+    if meta_max_gaussians is not None:
+        meta_max_gaussians = int(meta_max_gaussians)
+    if meta_max_gaussians != (None if max_gaussians is None else int(max_gaussians)):
+        return False
+    if meta.get("frame_files") != list(frame_files):
+        return False
+
+    tensor_counts = meta.get("tensor_counts")
+    offsets = meta.get("offsets")
+    point_counts = meta.get("point_counts")
+    sampled_counts = meta.get("sampled_counts")
+    scene_centers = meta.get("scene_centers")
+    scene_extents = meta.get("scene_extents")
+    source_paths = meta.get("source_paths")
+    if not all(isinstance(v, list) and len(v) == len(frame_files) for v in (
+        tensor_counts,
+        offsets,
+        point_counts,
+        sampled_counts,
+        scene_centers,
+        scene_extents,
+        source_paths,
+    )):
+        return False
+    if int(meta.get("feature_coeff_count", 0)) <= 0:
+        return False
+    if int(meta.get("total_points", 0)) < sum(int(v) for v in tensor_counts):
+        return False
+    return True
+
+
+@lru_cache(maxsize=32)
+def _open_packed_cache_memmap(path, shape):
+    return np.memmap(path, mode='r', dtype=np.float32, shape=shape)
+
+
 def is_sequence_cache_compatible(meta, sequence_dir, frame_files, sh_degree, max_gaussians):
     if not meta:
         return False
@@ -491,6 +575,14 @@ def build_sequence_cache(
     if not overwrite and is_sequence_cache_compatible(meta, sequence_dir, frame_files, sh_degree, max_gaussians):
         frame_cache_paths = [os.path.join(resolved_cache_dir, name) for name in meta["frame_cache_files"]]
         if all(os.path.exists(path) for path in frame_cache_paths):
+            build_packed_sequence_cache(
+                sequence_dir,
+                sh_degree=sh_degree,
+                max_gaussians=max_gaussians,
+                cache_dir=resolved_cache_dir,
+                overwrite=False,
+                verbose=verbose,
+            )
             if verbose:
                 print(f"已存在可用播放器缓存: {resolved_cache_dir}")
             return resolved_cache_dir
@@ -537,8 +629,160 @@ def build_sequence_cache(
         json.dump(meta_payload, f, ensure_ascii=False, indent=2)
     os.replace(meta_tmp_path, os.path.join(resolved_cache_dir, "meta.json"))
 
+    build_packed_sequence_cache(
+        sequence_dir,
+        sh_degree=sh_degree,
+        max_gaussians=max_gaussians,
+        cache_dir=resolved_cache_dir,
+        overwrite=overwrite,
+        verbose=verbose,
+    )
+
     if verbose:
         print(f"播放器缓存构建完成，用时 {time.time() - start_time:.1f}s")
+    return resolved_cache_dir
+
+
+def build_packed_sequence_cache(
+    sequence_dir,
+    sh_degree=3,
+    max_gaussians=None,
+    cache_dir=None,
+    overwrite=False,
+    verbose=True,
+):
+    frame_files = sorted([f for f in os.listdir(sequence_dir) if f.endswith('.ply')])
+    if not frame_files:
+        raise ValueError(f"在 {sequence_dir} 中未找到PLY文件")
+
+    resolved_cache_dir = make_sequence_cache_dir(sequence_dir, sh_degree, max_gaussians, cache_dir=cache_dir)
+    os.makedirs(resolved_cache_dir, exist_ok=True)
+
+    packed_meta = load_packed_sequence_cache_metadata(resolved_cache_dir)
+    packed_paths = _packed_cache_file_paths(resolved_cache_dir, packed_meta)
+    if (
+        not overwrite
+        and is_packed_sequence_cache_compatible(packed_meta, sequence_dir, frame_files, sh_degree, max_gaussians)
+        and all(os.path.exists(path) for path in packed_paths.values())
+    ):
+        if verbose:
+            print(f"已存在可用顺序缓存: {resolved_cache_dir}")
+        return resolved_cache_dir
+
+    legacy_meta = load_sequence_cache_metadata(resolved_cache_dir)
+    use_legacy_cache = is_sequence_cache_compatible(legacy_meta, sequence_dir, frame_files, sh_degree, max_gaussians)
+    legacy_frame_paths = None
+    if use_legacy_cache:
+        legacy_frame_paths = [os.path.join(resolved_cache_dir, name) for name in legacy_meta["frame_cache_files"]]
+        use_legacy_cache = all(os.path.exists(path) for path in legacy_frame_paths)
+
+    total_frames = len(frame_files)
+    start_time = time.time()
+    if verbose:
+        source_kind = "legacy-cache" if use_legacy_cache else "ply"
+        print(f"开始构建顺序缓存: {resolved_cache_dir}")
+        print(f"  帧数: {total_frames}, SH度数: {sh_degree}, max_gaussians: {max_gaussians}, 来源: {source_kind}")
+
+    tmp_paths = {key: f"{path}.tmp" for key, path in _packed_cache_file_paths(resolved_cache_dir).items()}
+    handles = {key: open(path, "wb") for key, path in tmp_paths.items()}
+
+    offsets = []
+    tensor_counts = []
+    point_counts = []
+    sampled_counts = []
+    scene_centers = []
+    scene_extents = []
+    source_paths = []
+    total_points = 0
+    feature_coeff_count = None
+    scaling_dim = None
+    rotation_dim = None
+    opacity_dim = None
+
+    try:
+        for idx, frame_file in enumerate(frame_files):
+            if use_legacy_cache:
+                frame = GaussianFrame.from_cache(
+                    legacy_frame_paths[idx],
+                    pin_memory=False,
+                    verbose=verbose and idx == 0,
+                )
+            else:
+                frame = GaussianFrame.from_ply(
+                    os.path.join(sequence_dir, frame_file),
+                    sh_degree=sh_degree,
+                    pin_memory=False,
+                    max_gaussians=max_gaussians,
+                    verbose=verbose and idx == 0,
+                )
+
+            xyz_np = frame.xyz.detach().cpu().contiguous().numpy().astype(np.float32, copy=False)
+            features_np = frame.features.detach().cpu().contiguous().numpy().astype(np.float32, copy=False)
+            scaling_np = frame.scaling.detach().cpu().contiguous().numpy().astype(np.float32, copy=False)
+            rotation_np = frame.rotation.detach().cpu().contiguous().numpy().astype(np.float32, copy=False)
+            opacity_np = frame.opacity.detach().cpu().contiguous().numpy().astype(np.float32, copy=False)
+
+            if feature_coeff_count is None:
+                feature_coeff_count = int(features_np.shape[1])
+                scaling_dim = int(scaling_np.shape[1])
+                rotation_dim = int(rotation_np.shape[1])
+                opacity_dim = int(opacity_np.shape[1])
+
+            count = int(xyz_np.shape[0])
+            offsets.append(int(total_points))
+            tensor_counts.append(count)
+            point_counts.append(int(frame.point_count))
+            sampled_counts.append(int(frame.sampled_count))
+            scene_centers.append(frame.scene_center.astype(np.float32).tolist())
+            scene_extents.append(float(frame.scene_extent))
+            source_paths.append(frame.source_path)
+
+            xyz_np.tofile(handles["xyz"])
+            features_np.tofile(handles["features"])
+            scaling_np.tofile(handles["scaling"])
+            rotation_np.tofile(handles["rotation"])
+            opacity_np.tofile(handles["opacity"])
+            total_points += count
+
+            if verbose and (idx == total_frames - 1 or (idx + 1) % max(1, min(20, total_frames)) == 0):
+                print(f"  顺序缓存进度: {idx + 1}/{total_frames}")
+    finally:
+        for fh in handles.values():
+            fh.close()
+
+    meta_payload = {
+        "packed_version": PLAYER_SEQUENCE_PACKED_CACHE_VERSION,
+        "source_dir": os.path.abspath(sequence_dir),
+        "frame_files": frame_files,
+        "num_frames": total_frames,
+        "sh_degree": int(sh_degree),
+        "max_gaussians": None if max_gaussians is None else int(max_gaussians),
+        "total_points": int(total_points),
+        "tensor_counts": tensor_counts,
+        "offsets": offsets,
+        "point_counts": point_counts,
+        "sampled_counts": sampled_counts,
+        "scene_centers": scene_centers,
+        "scene_extents": scene_extents,
+        "source_paths": source_paths,
+        "feature_coeff_count": int(feature_coeff_count or 0),
+        "scaling_dim": int(scaling_dim or 0),
+        "rotation_dim": int(rotation_dim or 0),
+        "opacity_dim": int(opacity_dim or 0),
+        "file_names": dict(PLAYER_SEQUENCE_PACKED_FILE_NAMES),
+        "created_at": datetime.now().isoformat(),
+    }
+
+    for key, final_path in _packed_cache_file_paths(resolved_cache_dir, meta_payload).items():
+        os.replace(tmp_paths[key], final_path)
+
+    meta_tmp_path = os.path.join(resolved_cache_dir, f"{PLAYER_SEQUENCE_PACKED_META_NAME}.tmp")
+    with open(meta_tmp_path, "w", encoding="utf-8") as f:
+        json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+    os.replace(meta_tmp_path, os.path.join(resolved_cache_dir, PLAYER_SEQUENCE_PACKED_META_NAME))
+
+    if verbose:
+        print(f"顺序缓存构建完成，用时 {time.time() - start_time:.1f}s")
     return resolved_cache_dir
 
 
@@ -719,9 +963,12 @@ class GaussianFrame:
         if verbose:
             print(f"正在加载缓存帧: {path}")
         try:
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-        except TypeError:
-            payload = torch.load(path, map_location="cpu")
+            payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+        except (TypeError, RuntimeError, ValueError):
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
 
         def _cpu_tensor(value):
             if isinstance(value, torch.Tensor):
@@ -747,6 +994,58 @@ class GaussianFrame:
             source_path=payload.get("source_path", path),
             point_count=int(payload.get("point_count", payload["xyz"].shape[0])),
             sampled_count=int(payload.get("sampled_count", payload["xyz"].shape[0])),
+        )
+
+    @classmethod
+    def from_packed_cache(cls, cache_dir, packed_meta, frame_idx, pin_memory=False, verbose=False):
+        frame_idx = int(frame_idx) % int(packed_meta["num_frames"])
+        if verbose:
+            print(f"正在加载顺序缓存帧: {frame_idx + 1}/{packed_meta['num_frames']}")
+
+        offset = int(packed_meta["offsets"][frame_idx])
+        count = int(packed_meta["tensor_counts"][frame_idx])
+        total_points = int(packed_meta["total_points"])
+        feature_coeff_count = int(packed_meta["feature_coeff_count"])
+        scaling_dim = int(packed_meta["scaling_dim"])
+        rotation_dim = int(packed_meta["rotation_dim"])
+        opacity_dim = int(packed_meta["opacity_dim"])
+        packed_paths = _packed_cache_file_paths(cache_dir, packed_meta)
+        frame_slice = slice(offset, offset + count)
+
+        xyz_np = np.array(
+            _open_packed_cache_memmap(packed_paths["xyz"], (total_points, 3))[frame_slice],
+            copy=True,
+        )
+        features_np = np.array(
+            _open_packed_cache_memmap(packed_paths["features"], (total_points, feature_coeff_count, 3))[frame_slice],
+            copy=True,
+        )
+        scaling_np = np.array(
+            _open_packed_cache_memmap(packed_paths["scaling"], (total_points, scaling_dim))[frame_slice],
+            copy=True,
+        )
+        rotation_np = np.array(
+            _open_packed_cache_memmap(packed_paths["rotation"], (total_points, rotation_dim))[frame_slice],
+            copy=True,
+        )
+        opacity_np = np.array(
+            _open_packed_cache_memmap(packed_paths["opacity"], (total_points, opacity_dim))[frame_slice],
+            copy=True,
+        )
+
+        scene_center = np.asarray(packed_meta["scene_centers"][frame_idx], dtype=np.float32)
+        return cls(
+            xyz=cls._maybe_pin(torch.from_numpy(xyz_np).contiguous(), pin_memory),
+            features=cls._maybe_pin(torch.from_numpy(features_np).contiguous(), pin_memory),
+            scaling=cls._maybe_pin(torch.from_numpy(scaling_np).contiguous(), pin_memory),
+            rotation=cls._maybe_pin(torch.from_numpy(rotation_np).contiguous(), pin_memory),
+            opacity=cls._maybe_pin(torch.from_numpy(opacity_np).contiguous(), pin_memory),
+            sh_degree=int(packed_meta["sh_degree"]),
+            scene_center=scene_center,
+            scene_extent=float(packed_meta["scene_extents"][frame_idx]),
+            source_path=packed_meta["source_paths"][frame_idx],
+            point_count=int(packed_meta["point_counts"][frame_idx]),
+            sampled_count=int(packed_meta["sampled_counts"][frame_idx]),
         )
 
 
@@ -814,6 +1113,7 @@ class SequenceManager:
         self.cache_dir = None
         self.cache_meta = None
         self.cache_frame_paths = None
+        self.packed_cache_meta = None
         self.load_backend = "ply"
         
         self.cpu_cache = OrderedDict()
@@ -839,9 +1139,27 @@ class SequenceManager:
                 max_gaussians=max_gaussians,
                 cache_dir=cache_dir,
             )
+            packed_meta = load_packed_sequence_cache_metadata(resolved_cache_dir)
+            packed_paths = _packed_cache_file_paths(resolved_cache_dir, packed_meta)
+            has_packed_cache = (
+                is_packed_sequence_cache_compatible(
+                    packed_meta,
+                    sequence_dir,
+                    self.frame_files,
+                    sh_degree,
+                    max_gaussians,
+                )
+                and all(os.path.exists(path) for path in packed_paths.values())
+            )
+            if has_packed_cache:
+                self.cache_dir = resolved_cache_dir
+                self.packed_cache_meta = packed_meta
+                self.load_backend = "packed"
+                print(f"检测到顺序播放器缓存: {self.cache_dir}")
+
             meta = load_sequence_cache_metadata(resolved_cache_dir)
             has_compatible_cache = False
-            if is_sequence_cache_compatible(meta, sequence_dir, self.frame_files, sh_degree, max_gaussians):
+            if not has_packed_cache and is_sequence_cache_compatible(meta, sequence_dir, self.frame_files, sh_degree, max_gaussians):
                 frame_cache_paths = [os.path.join(resolved_cache_dir, name) for name in meta["frame_cache_files"]]
                 has_compatible_cache = all(os.path.exists(path) for path in frame_cache_paths)
                 if has_compatible_cache:
@@ -851,7 +1169,7 @@ class SequenceManager:
                     self.load_backend = "cache"
                     print(f"检测到播放器缓存: {self.cache_dir}")
 
-            if not has_compatible_cache:
+            if not has_packed_cache and not has_compatible_cache:
                 print(f"未找到可用播放器缓存，开始在序列目录内构建: {resolved_cache_dir}")
                 build_sequence_cache(
                     sequence_dir,
@@ -861,17 +1179,50 @@ class SequenceManager:
                     overwrite=cache_overwrite,
                     verbose=True,
                 )
-                meta = load_sequence_cache_metadata(resolved_cache_dir)
-                if is_sequence_cache_compatible(meta, sequence_dir, self.frame_files, sh_degree, max_gaussians):
-                    frame_cache_paths = [os.path.join(resolved_cache_dir, name) for name in meta["frame_cache_files"]]
-                    if all(os.path.exists(path) for path in frame_cache_paths):
-                        self.cache_dir = resolved_cache_dir
-                        self.cache_meta = meta
-                        self.cache_frame_paths = frame_cache_paths
-                        self.load_backend = "cache"
-                        print(f"播放器缓存已就绪: {self.cache_dir}")
+            elif not has_packed_cache and has_compatible_cache:
+                print(f"检测到旧版逐帧缓存，开始升级顺序缓存: {resolved_cache_dir}")
+                build_packed_sequence_cache(
+                    sequence_dir,
+                    sh_degree=sh_degree,
+                    max_gaussians=max_gaussians,
+                    cache_dir=resolved_cache_dir,
+                    overwrite=cache_overwrite,
+                    verbose=True,
+                )
+            if not has_packed_cache:
+                packed_meta = load_packed_sequence_cache_metadata(resolved_cache_dir)
+                packed_paths = _packed_cache_file_paths(resolved_cache_dir, packed_meta)
+                if (
+                    is_packed_sequence_cache_compatible(
+                        packed_meta,
+                        sequence_dir,
+                        self.frame_files,
+                        sh_degree,
+                        max_gaussians,
+                    )
+                    and all(os.path.exists(path) for path in packed_paths.values())
+                ):
+                    self.cache_dir = resolved_cache_dir
+                    self.packed_cache_meta = packed_meta
+                    self.load_backend = "packed"
+                    print(f"顺序播放器缓存已就绪: {self.cache_dir}")
+                else:
+                    meta = load_sequence_cache_metadata(resolved_cache_dir)
+                    if is_sequence_cache_compatible(meta, sequence_dir, self.frame_files, sh_degree, max_gaussians):
+                        frame_cache_paths = [os.path.join(resolved_cache_dir, name) for name in meta["frame_cache_files"]]
+                        if all(os.path.exists(path) for path in frame_cache_paths):
+                            self.cache_dir = resolved_cache_dir
+                            self.cache_meta = meta
+                            self.cache_frame_paths = frame_cache_paths
+                            self.load_backend = "cache"
+                            print(f"播放器缓存已就绪: {self.cache_dir}")
         
         self.load_mode = self._resolve_load_mode(load_mode)
+        if self.load_mode == self.LOAD_MODE_STREAM:
+            self.backward_prefetch = 0
+            self.adaptive_prefetch = False
+            self.prefetch_count = max(self.prefetch_count, self.cpu_cache_size - 1)
+            self.max_pending_cpu = max(self.max_pending_cpu, self.prefetch_count, self.io_workers)
         print(f"找到 {self.num_frames} 帧序列")
         print(f"序列磁盘占用: {self.total_sequence_bytes / (1024 ** 3):.2f} GB")
         
@@ -884,10 +1235,10 @@ class SequenceManager:
                 max_workers=self.io_workers,
                 thread_name_prefix="ply-stream-loader",
             )
-            print("使用流式加载模式: 小显存缓存 + CPU预取 + 后台读盘")
+            print("使用流式滑动窗口模式: CPU前向窗口 + GPU热帧窗口 + 后台读盘")
             print(
                 f"  目标播放FPS: {self.fps:.1f}, GPU缓存: {self.gpu_cache_size}, "
-                f"CPU缓存: {self.cpu_cache_size}, 预取帧数: {self.prefetch_count}, "
+                f"CPU窗口: {self.cpu_cache_size}, 预读帧数: {self.prefetch_count}, "
                 f"IO线程: {self.io_workers}, 数据源: {self.load_backend}"
             )
             if self.max_gaussians:
@@ -912,9 +1263,23 @@ class SequenceManager:
             total_ram_bytes = int(page_size * total_pages)
         except (ValueError, AttributeError, OSError):
             total_ram_bytes = None
+        available_ram_bytes = get_available_ram_bytes()
         
-        if total_ram_bytes is not None and self.total_sequence_bytes <= total_ram_bytes * 0.35:
-            print("自动选择 preload_cpu 模式: 序列可放入系统内存，优先避免播放期读盘抖动")
+        if available_ram_bytes is not None:
+            safe_available_budget = int(available_ram_bytes * 0.7)
+            if self.total_sequence_bytes <= safe_available_budget:
+                print(
+                    "自动选择 preload_cpu 模式: 当前可用内存充足，优先避免播放期读盘抖动"
+                    f" (序列 {self.total_sequence_bytes / (1024 ** 3):.2f} GB, "
+                    f"可用内存 {available_ram_bytes / (1024 ** 3):.2f} GB)"
+                )
+                return self.LOAD_MODE_PRELOAD_CPU
+        if total_ram_bytes is not None and self.total_sequence_bytes <= total_ram_bytes * 0.5:
+            print(
+                "自动选择 preload_cpu 模式: 序列尺寸在安全内存预算内"
+                f" (序列 {self.total_sequence_bytes / (1024 ** 3):.2f} GB, "
+                f"总内存 {total_ram_bytes / (1024 ** 3):.2f} GB)"
+            )
             return self.LOAD_MODE_PRELOAD_CPU
         
         print("自动选择 stream 模式: 序列较大或无法判断内存容量，使用流式缓存")
@@ -927,6 +1292,68 @@ class SequenceManager:
         if self.cache_frame_paths is None:
             return None
         return self.cache_frame_paths[frame_idx % self.num_frames]
+
+    def _stream_direction(self):
+        return 1 if self.play_direction >= 0 else -1
+
+    def _stream_window_frames(self, total_frames):
+        total_frames = max(1, int(total_frames))
+        total_frames = min(self.num_frames, total_frames)
+        frames = []
+        offset = 0
+        direction = self._stream_direction()
+        while len(frames) < total_frames:
+            frame_idx = (self.current_frame + direction * offset) % self.num_frames
+            if frame_idx not in frames:
+                frames.append(frame_idx)
+            offset += 1
+        return frames
+
+    def _cpu_window_frames(self):
+        return self._stream_window_frames(self.cpu_cache_size)
+
+    def _gpu_window_frames(self):
+        return self._stream_window_frames(self.gpu_cache_size)
+
+    def _cpu_prefetch_targets(self):
+        return self._cpu_window_frames()[1:]
+
+    def _gpu_prefetch_targets(self):
+        return self._gpu_window_frames()[1:]
+
+    def _prune_stream_windows(self):
+        if self.load_mode != self.LOAD_MODE_STREAM:
+            return
+
+        cpu_keep = set(self._cpu_window_frames())
+        gpu_keep = set(self._gpu_window_frames())
+
+        for frame_idx in list(self.cpu_cache.keys()):
+            if frame_idx not in cpu_keep:
+                self.cpu_cache.pop(frame_idx, None)
+
+        for frame_idx in list(self.gpu_cache.keys()):
+            if frame_idx not in gpu_keep:
+                self.gpu_cache.pop(frame_idx, None)
+
+        for frame_idx, future in list(self.pending_cpu.items()):
+            if frame_idx in cpu_keep:
+                continue
+            if future.cancel():
+                self.pending_cpu.pop(frame_idx, None)
+            elif future.done():
+                try:
+                    future.result()
+                except Exception:
+                    pass
+                self.pending_cpu.pop(frame_idx, None)
+
+        for frame_idx, pending_entry in list(self.pending_gpu.items()):
+            if frame_idx in gpu_keep:
+                continue
+            _frame, _cpu_ref, ready_event = pending_entry
+            if ready_event is None or ready_event.query():
+                self.pending_gpu.pop(frame_idx, None)
     
     def _update_avg_stat(self, key, value, alpha=0.1):
         current = self.load_stats.get(key, 0.0)
@@ -937,7 +1364,15 @@ class SequenceManager:
 
     def _load_frame_cpu_sync(self, frame_idx, verbose=None):
         load_start = time.time()
-        if self.cache_frame_paths is not None:
+        if self.packed_cache_meta is not None:
+            frame = GaussianFrame.from_packed_cache(
+                self.cache_dir,
+                self.packed_cache_meta,
+                frame_idx,
+                pin_memory=self.pin_memory,
+                verbose=self.verbose_frame_loads if verbose is None else verbose,
+            )
+        elif self.cache_frame_paths is not None:
             frame = GaussianFrame.from_cache(
                 self._frame_cache_path(frame_idx),
                 pin_memory=self.pin_memory,
@@ -957,14 +1392,20 @@ class SequenceManager:
     def _insert_cpu_cache(self, frame_idx, frame):
         self.cpu_cache[frame_idx] = frame
         self.cpu_cache.move_to_end(frame_idx)
-        while len(self.cpu_cache) > self.cpu_cache_size:
-            self.cpu_cache.popitem(last=False)
+        if self.load_mode == self.LOAD_MODE_STREAM:
+            self._prune_stream_windows()
+        else:
+            while len(self.cpu_cache) > self.cpu_cache_size:
+                self.cpu_cache.popitem(last=False)
     
     def _insert_gpu_cache(self, frame_idx, frame):
         self.gpu_cache[frame_idx] = frame
         self.gpu_cache.move_to_end(frame_idx)
-        while len(self.gpu_cache) > self.gpu_cache_size:
-            self.gpu_cache.popitem(last=False)
+        if self.load_mode == self.LOAD_MODE_STREAM:
+            self._prune_stream_windows()
+        else:
+            while len(self.gpu_cache) > self.gpu_cache_size:
+                self.gpu_cache.popitem(last=False)
 
     def _resolve_pending_gpu(self, frame_idx, block=False):
         entry = self.pending_gpu.get(frame_idx)
@@ -1115,46 +1556,19 @@ class SequenceManager:
         )
 
     def _effective_prefetch_count(self):
+        if self.load_mode == self.LOAD_MODE_STREAM:
+            return max(0, min(self.num_frames - 1, self.cpu_cache_size - 1))
         if self.num_frames <= 1:
             return 0
-
-        count = self.prefetch_count
-        if self.adaptive_prefetch and self.fps > 0:
-            est_load = max(
-                self.load_stats.get('load_time_avg', 0.0),
-                self.load_stats.get('cpu_load_time_avg', 0.0)
-                + self.load_stats.get('gpu_upload_time_avg', 0.0),
-            )
-            if est_load > 0.0:
-                count = max(count, int(math.ceil(est_load * self.fps)) + self.io_workers)
-
-        if self.dynamic_cache:
-            window_limit = self.cpu_cache_size + self.max_pending_cpu - 1
-        else:
-            window_limit = self.prefetch_count
-
-        count = min(count, max(0, window_limit))
-        return min(self.num_frames - 1, count)
+        return max(0, min(self.num_frames - 1, self.prefetch_count))
 
     def _get_prefetch_targets(self, center_idx):
+        if self.load_mode == self.LOAD_MODE_STREAM:
+            return self._cpu_prefetch_targets()
         forward_count = self._effective_prefetch_count()
-        backward_count = min(self.backward_prefetch, self.num_frames - 1)
-        if forward_count <= 0 and backward_count <= 0:
+        if forward_count <= 0:
             return []
-
-        targets = []
-        if self.play_direction >= 0:
-            primary_offsets = [center_idx + offset for offset in range(1, forward_count + 1)]
-            secondary_offsets = [center_idx - offset for offset in range(1, backward_count + 1)]
-        else:
-            primary_offsets = [center_idx - offset for offset in range(1, forward_count + 1)]
-            secondary_offsets = [center_idx + offset for offset in range(1, backward_count + 1)]
-
-        for raw_idx in primary_offsets + secondary_offsets:
-            frame_idx = raw_idx % self.num_frames
-            if frame_idx not in targets and frame_idx != center_idx:
-                targets.append(frame_idx)
-        return targets
+        return [(center_idx + offset) % self.num_frames for offset in range(1, forward_count + 1)]
 
     def _drop_stale_prefetch(self, keep_targets):
         keep = set(keep_targets)
@@ -1170,6 +1584,7 @@ class SequenceManager:
             return []
 
         targets = self._get_prefetch_targets(self.current_frame)
+        self._prune_stream_windows()
         self._drop_stale_prefetch(targets)
 
         for frame_idx in targets:
@@ -1179,6 +1594,7 @@ class SequenceManager:
         return targets
     
     def service_prefetch(self):
+        cpu_keep = set(self._cpu_window_frames()) if self.load_mode == self.LOAD_MODE_STREAM else None
         for frame_idx, future in list(self.pending_cpu.items()):
             if future.done():
                 try:
@@ -1186,15 +1602,17 @@ class SequenceManager:
                 except Exception as exc:
                     print(f"预取失败(frame {frame_idx}): {exc}")
                 else:
-                    self._insert_cpu_cache(frame_idx, frame)
+                    if cpu_keep is None or frame_idx in cpu_keep:
+                        self._insert_cpu_cache(frame_idx, frame)
                 finally:
                     self.pending_cpu.pop(frame_idx, None)
         
         if self.load_mode != self.LOAD_MODE_STREAM:
             return
 
+        self._prune_stream_windows()
         targets = self._fill_cpu_prefetch_queue()
-        for frame_idx in targets:
+        for frame_idx in self._gpu_prefetch_targets():
             if frame_idx in self.cpu_cache and frame_idx not in self.gpu_cache and frame_idx not in self.pending_gpu:
                 if len(self.gpu_cache) + len(self.pending_gpu) >= self.gpu_cache_size:
                     break
@@ -1341,10 +1759,20 @@ class SequenceManager:
         self.prefetch_around(self.current_frame)
     
     def get_cache_status(self):
+        if self.load_mode == self.LOAD_MODE_STREAM:
+            window_frames = self._cpu_window_frames()
+            if window_frames:
+                start_idx = window_frames[0] + 1
+                end_idx = window_frames[-1] + 1
+                window_desc = f"窗口:{start_idx}->{end_idx}"
+            else:
+                window_desc = "窗口:-"
+        else:
+            window_desc = "窗口:all"
         return (
             f"{self.load_mode}/{self.load_backend} | GPU {len(self.gpu_cache)}/{self.gpu_cache_size} | "
             f"CPU {len(self.cpu_cache)}/{self.cpu_cache_size} (+{len(self.pending_cpu)}) | "
-            f"IO x{self.io_workers}"
+            f"{window_desc} | IO x{self.io_workers}"
         )
     
     def get_load_stats(self):

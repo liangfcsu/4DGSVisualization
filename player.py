@@ -95,6 +95,11 @@ CAMERA_MOTION_KEYS = {
     Qt.Key_J, Qt.Key_L, Qt.Key_U, Qt.Key_O,
 }
 
+
+def _recommended_io_workers() -> int:
+    cpu_count = os.cpu_count() or 8
+    return max(4, min(8, cpu_count))
+
 PLAYER_QSS = """
 QMainWindow, QWidget#CentralShell {
     background: #09111a;
@@ -1121,14 +1126,20 @@ def _build_objects(args):
 
     # 序列管理器
     if sequence_dir:
+        io_workers = _core.clamp_positive_int(getattr(args, 'io_workers', None), _recommended_io_workers())
+        gpu_cache_size = _core.clamp_positive_int(getattr(args, 'gpu_cache_size', 16), 16)
+        cpu_cache_size = _core.clamp_positive_int(getattr(args, 'cpu_cache_size', 10), 10)
+        default_prefetch = max(1, cpu_cache_size - 1)
+        prefetch_count = max(0, int(getattr(args, 'prefetch_count', default_prefetch)))
         seq_mgr = SequenceManager(
             sequence_dir,
             sh_degree     = sh_degree,
             playback_fps  = playback_fps,
             load_mode     = getattr(args, 'load_mode', SequenceManager.LOAD_MODE_AUTO),
-            gpu_cache_size= _core.clamp_positive_int(getattr(args, 'gpu_cache_size',  4), 4),
-            cpu_cache_size= _core.clamp_positive_int(getattr(args, 'cpu_cache_size',  8), 8),
-            prefetch_count= max(0, int(getattr(args, 'prefetch_count', 2))),
+            gpu_cache_size= gpu_cache_size,
+            cpu_cache_size= cpu_cache_size,
+            prefetch_count= prefetch_count,
+            io_workers    = io_workers,
             pin_memory    = not getattr(args, 'no_pin_memory', False),
             max_gaussians = getattr(args, 'max_gaussians', None),
         )
@@ -1192,9 +1203,14 @@ def main():
                                  SequenceManager.LOAD_MODE_STREAM,
                                  SequenceManager.LOAD_MODE_PRELOAD_CPU,
                                  SequenceManager.LOAD_MODE_PRELOAD_GPU])
-    parser.add_argument("--gpu-cache-size",   type=int, default=16)
-    parser.add_argument("--cpu-cache-size",   type=int, default=8)
-    parser.add_argument("--prefetch-count",   type=int, default=2)
+    parser.add_argument("--gpu-cache-size",   type=int, default=16,
+                        help="GPU热帧窗口大小，适合缓存当前帧及后续几帧")
+    parser.add_argument("--cpu-cache-size",   type=int, default=10,
+                        help="CPU前向滑动窗口大小，默认10帧")
+    parser.add_argument("--prefetch-count",   type=int, default=9,
+                        help="前向预读帧数，默认与CPU窗口匹配")
+    parser.add_argument("--io-workers",       type=int, default=None,
+                        help="后台缓存帧读取线程数，默认自动 4-8")
     parser.add_argument("--max-gaussians",    type=int, default=None,    help="每帧最多高斯点数（适合预览大规模场景）")
     parser.add_argument("--no-pin-memory",    action="store_true")
     parser.add_argument("--white_background","-w", action="store_true")
