@@ -540,6 +540,21 @@ class MainWindow(QMainWindow):
         tb.addWidget(btn2)
 
         tb.addSeparator()
+        
+        # 相机选择（如果有加载的相机）
+        if self.camera.cameras_info and len(self.camera.cameras_info) > 0:
+            tb.addWidget(self._lbl(" 相机位姿:"))
+            self.camera_combo = QComboBox()
+            self.camera_combo.addItem("自由视角")
+            for i, cam in enumerate(self.camera.cameras_info):
+                self.camera_combo.addItem(f"{i+1}. {cam['name']}")
+            self.camera_combo.setMinimumWidth(120)
+            self.camera_combo.setToolTip("选择相机位姿 (N下一个 / P跳转最近)")
+            tb.addWidget(self.camera_combo)
+            tb.addSeparator()
+        else:
+            self.camera_combo = None
+        
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -694,6 +709,9 @@ class MainWindow(QMainWindow):
         self._register_shortcut(Qt.Key_2, lambda: self._shortcut_resolution(1))
         self._register_shortcut(Qt.Key_3, lambda: self._shortcut_resolution(2))
         self._register_shortcut(Qt.Key_4, lambda: self._shortcut_resolution(3))
+        self._register_shortcut(Qt.Key_N, self._next_camera)
+        self._register_shortcut(Qt.Key_P, self._snap_to_nearest_camera)
+        self._register_shortcut(Qt.Key_R, self._reset_camera)
 
     def _shortcut_trackball(self):
         self.camera.switch_mode(InteractiveCamera.MODE_TRACKBALL)
@@ -745,6 +763,9 @@ class MainWindow(QMainWindow):
         self.res_combo.currentIndexChanged.connect(self._on_res_changed)
         self.bg_combo.currentIndexChanged.connect(self._on_bg_changed)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        
+        if self.camera_combo:
+            self.camera_combo.currentIndexChanged.connect(self._on_camera_changed)
 
         if self.seq:
             self.btn_first.clicked.connect(lambda: (self.seq.set_frame(0), self._reload()))
@@ -935,6 +956,41 @@ class MainWindow(QMainWindow):
         if 0 <= idx < len(modes):
             self.camera.mode = modes[idx]
             self._request_render()
+    
+    def _on_camera_changed(self, idx):
+        """相机选择下拉框回调"""
+        if idx == 0:
+            # 自由视角 - 重置相机
+            self.camera.current_camera_idx = -1
+        else:
+            # 切换到指定相机
+            camera_idx = idx - 1
+            if self.camera.set_camera(camera_idx):
+                pass
+        self._request_render()
+    
+    def _next_camera(self):
+        """切换到下一个相机 (N键)"""
+        if self.camera.cameras_info and len(self.camera.cameras_info) > 0:
+            self.camera.next_camera()
+            # 同步下拉框
+            if self.camera_combo:
+                self.camera_combo.blockSignals(True)
+                self.camera_combo.setCurrentIndex(self.camera.current_camera_idx + 1)
+                self.camera_combo.blockSignals(False)
+            self._request_render()
+    
+    def _snap_to_nearest_camera(self):
+        """跳转到最近的相机 (P键)"""
+        if self.camera.cameras_info and len(self.camera.cameras_info) > 0:
+            self.camera.snap_to_nearest_camera()
+            # 同步下拉框
+            if self.camera_combo:
+                self.camera_combo.blockSignals(True)
+                self.camera_combo.setCurrentIndex(self.camera.current_camera_idx + 1)
+                self.camera_combo.blockSignals(False)
+            self._request_render()
+
 
     def _on_play_toggled(self, checked: bool):
         if self.seq:
@@ -1120,9 +1176,16 @@ def _build_objects(args):
 
     # 加载相机
     data_path = getattr(args, 'path', None)
-    if data_path:
+    sparse_path = getattr(args, 'sparse', None)
+    
+    if sparse_path and os.path.isdir(sparse_path):
+        # 从 COLMAP sparse 数据加载
+        cameras = _core.load_cameras_from_colmap(sparse_path)
+    elif data_path:
         cameras_json = os.path.join(data_path, "cameras.json")
         cameras      = _core.load_cameras_from_json(cameras_json)
+    else:
+        cameras = []
 
     # 序列管理器
     if sequence_dir:
@@ -1194,6 +1257,7 @@ def main():
     parser.add_argument("input",              nargs="?", default=None,   help="PLY 文件或序列目录")
     parser.add_argument("--model-path","-m",  default=None, dest="model_path")
     parser.add_argument("--path","-s",        default=None,              help="cameras.json 所在目录")
+    parser.add_argument("--sparse",           default=None,              help="COLMAP sparse 重建目录 (包含 cameras.bin/txt 和 images.bin/txt)")
     parser.add_argument("--ply_path",         default=None)
     parser.add_argument("--render-resolution",default="1080p",           help="渲染分辨率: 720p/1080p/2k/4k/WxH  [默认: 1080p]")
     parser.add_argument("--playback-fps",     type=float, default=30.0,  help="播放帧率 [默认: 30]")

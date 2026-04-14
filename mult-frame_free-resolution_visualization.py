@@ -135,6 +135,217 @@ def parse_cfg_args(model_path):
     return config
 
 
+def qvec2rotmat(qvec):
+    """四元数转旋转矩阵 (COLMAP 格式: w, x, y, z)"""
+    return np.array([
+        [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
+         2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+         2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
+        [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+         1 - 2 * qvec[1]**2 - 2 * qvec[3]**2,
+         2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
+        [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+         2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+         1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]])
+
+
+def read_colmap_cameras_binary(path_to_model_file):
+    """读取 COLMAP cameras.bin 文件"""
+    import struct
+    cameras = {}
+    with open(path_to_model_file, "rb") as fid:
+        num_cameras = struct.unpack("Q", fid.read(8))[0]
+        for _ in range(num_cameras):
+            camera_properties = struct.unpack("iiQQ", fid.read(24))
+            camera_id = camera_properties[0]
+            model_id = camera_properties[1]
+            width = camera_properties[2]
+            height = camera_properties[3]
+            num_params = struct.unpack("Q", fid.read(8))[0]
+            params = struct.unpack("d" * num_params, fid.read(8 * num_params))
+            cameras[camera_id] = {
+                'id': camera_id,
+                'model': model_id,
+                'width': int(width),
+                'height': int(height),
+                'params': params
+            }
+    return cameras
+
+
+def read_colmap_cameras_text(path_to_model_file):
+    """读取 COLMAP cameras.txt 文件"""
+    cameras = {}
+    with open(path_to_model_file, "r") as fid:
+        for line in fid:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            elems = line.split()
+            camera_id = int(elems[0])
+            model = elems[1]
+            width = int(elems[2])
+            height = int(elems[3])
+            params = tuple(map(float, elems[4:]))
+            cameras[camera_id] = {
+                'id': camera_id,
+                'model': model,
+                'width': width,
+                'height': height,
+                'params': params
+            }
+    return cameras
+
+
+def read_colmap_images_binary(path_to_model_file):
+    """读取 COLMAP images.bin 文件"""
+    import struct
+    images = {}
+    with open(path_to_model_file, "rb") as fid:
+        num_reg_images = struct.unpack("Q", fid.read(8))[0]
+        for _ in range(num_reg_images):
+            binary_image_properties = struct.unpack("idddddddi", fid.read(64))
+            image_id = binary_image_properties[0]
+            qvec = np.array(binary_image_properties[1:5])
+            tvec = np.array(binary_image_properties[5:8])
+            camera_id = binary_image_properties[8]
+            image_name = ""
+            current_char = struct.unpack("c", fid.read(1))[0]
+            while current_char != b"\x00":
+                image_name += current_char.decode("utf-8")
+                current_char = struct.unpack("c", fid.read(1))[0]
+            num_points2D = struct.unpack("Q", fid.read(8))[0]
+            fid.read(24 * num_points2D)  # 跳过 2D 点
+            
+            images[image_id] = {
+                'id': image_id,
+                'qvec': qvec,
+                'tvec': tvec,
+                'camera_id': camera_id,
+                'name': image_name
+            }
+    return images
+
+
+def read_colmap_images_text(path_to_model_file):
+    """读取 COLMAP images.txt 文件"""
+    images = {}
+    with open(path_to_model_file, "r") as fid:
+        while True:
+            line = fid.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            elems = line.split()
+            image_id = int(elems[0])
+            qvec = np.array(tuple(map(float, elems[1:5])))
+            tvec = np.array(tuple(map(float, elems[5:8])))
+            camera_id = int(elems[8])
+            image_name = elems[9]
+            
+            images[image_id] = {
+                'id': image_id,
+                'qvec': qvec,
+                'tvec': tvec,
+                'camera_id': camera_id,
+                'name': image_name
+            }
+            
+            # 跳过下一行（2D 点）
+            fid.readline()
+    return images
+
+
+def load_cameras_from_colmap(sparse_dir):
+    """从 COLMAP sparse 数据加载相机参数
+    
+    Args:
+        sparse_dir: COLMAP sparse 重建目录路径（包含 cameras.bin/txt 和 images.bin/txt）
+        
+    Returns:
+        cameras: 相机参数列表
+    """
+    cameras = []
+    
+    # 尝试读取二进制格式
+    cameras_file_bin = os.path.join(sparse_dir, "cameras.bin")
+    images_file_bin = os.path.join(sparse_dir, "images.bin")
+    cameras_file_txt = os.path.join(sparse_dir, "cameras.txt")
+    images_file_txt = os.path.join(sparse_dir, "images.txt")
+    
+    if os.path.exists(cameras_file_bin) and os.path.exists(images_file_bin):
+        print(f"从 COLMAP 二进制文件加载相机: {sparse_dir}")
+        colmap_cameras = read_colmap_cameras_binary(cameras_file_bin)
+        colmap_images = read_colmap_images_binary(images_file_bin)
+    elif os.path.exists(cameras_file_txt) and os.path.exists(images_file_txt):
+        print(f"从 COLMAP 文本文件加载相机: {sparse_dir}")
+        colmap_cameras = read_colmap_cameras_text(cameras_file_txt)
+        colmap_images = read_colmap_images_text(images_file_txt)
+    else:
+        print(f"警告: 未找到 COLMAP 相机文件在 {sparse_dir}")
+        return cameras
+    
+    # 转换为统一格式
+    for img_id, img_data in sorted(colmap_images.items()):
+        cam_id = img_data['camera_id']
+        if cam_id not in colmap_cameras:
+            continue
+            
+        cam_data = colmap_cameras[cam_id]
+        
+        # 从四元数和平移向量计算相机位置和旋转
+        qvec = img_data['qvec']
+        tvec = img_data['tvec']
+        
+        # COLMAP 使用 world-to-camera 变换
+        # R 将世界坐标转到相机坐标，t 是相机中心在世界坐标系中的位置（经过 R 变换后）
+        R_w2c = qvec2rotmat(qvec)
+        
+        # 相机中心位置：C = -R^T * t
+        camera_center = -R_w2c.T @ tvec
+        
+        # 3DGS 使用 camera-to-world 格式
+        # 所以我们需要相机在世界坐标中的旋转矩阵 R_c2w = R_w2c^T
+        R_c2w = R_w2c.T
+        
+        # 提取焦距参数（支持 SIMPLE_PINHOLE 和 PINHOLE 模型）
+        params = cam_data['params']
+        if isinstance(cam_data['model'], int):
+            # 二进制格式：model_id
+            # 0: SIMPLE_PINHOLE (f, cx, cy)
+            # 1: PINHOLE (fx, fy, cx, cy)
+            if cam_data['model'] == 0:  # SIMPLE_PINHOLE
+                fx = fy = params[0]
+            elif cam_data['model'] == 1:  # PINHOLE
+                fx, fy = params[0], params[1]
+            else:
+                fx = fy = params[0] if len(params) > 0 else 1000.0
+        else:
+            # 文本格式：model 是字符串
+            if cam_data['model'] == 'SIMPLE_PINHOLE':
+                fx = fy = params[0]
+            elif cam_data['model'] == 'PINHOLE':
+                fx, fy = params[0], params[1]
+            else:
+                fx = fy = params[0] if len(params) > 0 else 1000.0
+        
+        cameras.append({
+            'id': img_id,
+            'name': img_data['name'],
+            'width': cam_data['width'],
+            'height': cam_data['height'],
+            'position': camera_center.astype(np.float32),
+            'rotation': R_c2w.astype(np.float32),
+            'fx': float(fx),
+            'fy': float(fy)
+        })
+    
+    print(f"成功加载 {len(cameras)} 个相机位姿")
+    return cameras
+
+
 def load_cameras_from_json(json_path):
     """从cameras.json加载相机参数"""
     cameras = []
@@ -1115,6 +1326,12 @@ class SequenceManager:
         self.cache_frame_paths = None
         self.packed_cache_meta = None
         self.load_backend = "ply"
+        self.background_preload_enabled = False
+        self.background_preload_completed = False
+        self.background_preload_queue = []
+        self.background_preload_cursor = 0
+        self.background_preload_reported = 0
+        self.background_preload_report_step = 1
         
         self.cpu_cache = OrderedDict()
         self.gpu_cache = OrderedDict()
@@ -1170,8 +1387,8 @@ class SequenceManager:
                     print(f"检测到播放器缓存: {self.cache_dir}")
 
             if not has_packed_cache and not has_compatible_cache:
-                print(f"未找到可用播放器缓存，开始在序列目录内构建: {resolved_cache_dir}")
-                build_sequence_cache(
+                print(f"未找到可用播放器缓存，开始在序列目录内直接构建顺序缓存: {resolved_cache_dir}")
+                build_packed_sequence_cache(
                     sequence_dir,
                     sh_degree=sh_degree,
                     max_gaussians=max_gaussians,
@@ -1441,20 +1658,80 @@ class SequenceManager:
         print("预加载完成！")
     
     def _preload_all_frames_to_cpu(self):
-        print("正在预加载所有帧到CPU内存...")
+        print("正在准备首帧，并在后台预加载剩余帧到CPU内存...")
         self.cpu_cache_size = max(self.cpu_cache_size, self.num_frames)
-        for i in range(self.num_frames):
-            frame_cpu = self._load_frame_cpu_sync(i, verbose=(i == 0 and self.verbose_frame_loads))
-            self._insert_cpu_cache(i, frame_cpu)
-            if i == self.num_frames - 1 or (i + 1) % max(1, min(16, self.num_frames)) == 0:
-                print(f"  CPU预加载进度: {i + 1}/{self.num_frames}")
-            if i == 0:
-                self.scene_center = frame_cpu.scene_center.copy()
-                self.scene_extent = frame_cpu.scene_extent
-                self.active_sh_degree = frame_cpu.sh_degree
-                self.current_point_count = frame_cpu.point_count
-                self.sampled_point_count = frame_cpu.sampled_count
+        first_frame = self._load_frame_cpu_sync(0, verbose=self.verbose_frame_loads)
+        self._insert_cpu_cache(0, first_frame)
+        self.scene_center = first_frame.scene_center.copy()
+        self.scene_extent = first_frame.scene_extent
+        self.active_sh_degree = first_frame.sh_degree
+        self.current_point_count = first_frame.point_count
+        self.sampled_point_count = first_frame.sampled_count
+        self.background_preload_report_step = max(1, min(16, self.num_frames))
+        self.background_preload_reported = 1
+        print(f"  CPU预加载进度: 1/{self.num_frames}")
+
+        if self.num_frames <= 1:
+            self.background_preload_completed = True
+            print("CPU预加载完成，播放时只做GPU换帧")
+            return
+
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.io_workers,
+            thread_name_prefix="ply-preload-loader",
+        )
+        self.background_preload_enabled = True
+        self.background_preload_completed = False
+        self.background_preload_queue = list(range(1, self.num_frames))
+        self.background_preload_cursor = 0
+        self._fill_background_preload_queue()
+        print(f"首帧已就绪，剩余 {self.num_frames - 1} 帧正在后台预加载")
+
+    def _report_background_preload_progress(self, force=False):
+        if self.load_mode != self.LOAD_MODE_PRELOAD_CPU:
+            return
+        loaded_count = min(self.num_frames, len(self.cpu_cache))
+        if not force and loaded_count < self.num_frames:
+            if loaded_count - self.background_preload_reported < self.background_preload_report_step:
+                return
+        self.background_preload_reported = loaded_count
+        print(f"  CPU预加载进度: {loaded_count}/{self.num_frames}")
+
+    def _complete_background_preload(self):
+        if self.background_preload_completed:
+            return
+        self.background_preload_enabled = False
+        self.background_preload_completed = True
+        self._report_background_preload_progress(force=True)
         print("CPU预加载完成，播放时只做GPU换帧")
+        if self.executor is not None:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=False)
+            except TypeError:
+                self.executor.shutdown(wait=False)
+            self.executor = None
+
+    def _fill_background_preload_queue(self):
+        if (
+            self.load_mode != self.LOAD_MODE_PRELOAD_CPU
+            or not self.background_preload_enabled
+            or self.executor is None
+        ):
+            return
+
+        while (
+            len(self.pending_cpu) < self.max_pending_cpu
+            and self.background_preload_cursor < len(self.background_preload_queue)
+        ):
+            frame_idx = self.background_preload_queue[self.background_preload_cursor]
+            self.background_preload_cursor += 1
+            if frame_idx in self.cpu_cache or frame_idx in self.gpu_cache or frame_idx in self.pending_cpu:
+                continue
+            self.pending_cpu[frame_idx] = self.executor.submit(
+                self._load_frame_cpu_sync,
+                frame_idx,
+                False,
+            )
     
     def shutdown(self):
         if self.executor is not None:
@@ -1607,6 +1884,13 @@ class SequenceManager:
                 finally:
                     self.pending_cpu.pop(frame_idx, None)
         
+        if self.load_mode == self.LOAD_MODE_PRELOAD_CPU and self.background_preload_enabled:
+            self._report_background_preload_progress(force=False)
+            self._fill_background_preload_queue()
+            if len(self.cpu_cache) >= self.num_frames and not self.pending_cpu:
+                self._complete_background_preload()
+            return
+
         if self.load_mode != self.LOAD_MODE_STREAM:
             return
 
@@ -1767,6 +2051,8 @@ class SequenceManager:
                 window_desc = f"窗口:{start_idx}->{end_idx}"
             else:
                 window_desc = "窗口:-"
+        elif self.load_mode == self.LOAD_MODE_PRELOAD_CPU and not self.background_preload_completed:
+            window_desc = f"预加载:{len(self.cpu_cache)}/{self.num_frames}"
         else:
             window_desc = "窗口:all"
         return (
