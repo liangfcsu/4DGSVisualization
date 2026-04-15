@@ -87,6 +87,8 @@ else:
     PYGAME_K_KP_PLUS = ord('+')
     PYGAME_K_KP_MINUS = ord('-')
 
+SH_C0 = 0.28209479177387814
+
 
 def find_largest_iteration(point_cloud_dir):
     """查找最大迭代次数的子目录"""
@@ -1267,6 +1269,8 @@ class SequenceManager:
     LOAD_MODE_STREAM = "stream"
     LOAD_MODE_PRELOAD_CPU = "preload_cpu"
     LOAD_MODE_PRELOAD_GPU = "preload_gpu"
+    AUTO_STREAM_MIN_BYTES = 12 * 1024 ** 3
+    AUTO_STREAM_MIN_FRAMES = 96
     
     def __init__(
         self,
@@ -1481,6 +1485,19 @@ class SequenceManager:
         except (ValueError, AttributeError, OSError):
             total_ram_bytes = None
         available_ram_bytes = get_available_ram_bytes()
+
+        if (
+            self.load_backend == "packed"
+            and (
+                self.total_sequence_bytes >= self.AUTO_STREAM_MIN_BYTES
+                or self.num_frames >= self.AUTO_STREAM_MIN_FRAMES
+            )
+        ):
+            print(
+                "自动选择 stream 模式: 已有顺序缓存且序列较大，优先快速进入 + 滑动窗口预读"
+                f" (序列 {self.total_sequence_bytes / (1024 ** 3):.2f} GB, 帧数 {self.num_frames})"
+            )
+            return self.LOAD_MODE_STREAM
         
         if available_ram_bytes is not None:
             safe_available_budget = int(available_ram_bytes * 0.7)
@@ -2598,12 +2615,62 @@ class InteractiveCamera:
 
 class GaussianRenderer:
     """3D Gaussian Splatting渲染器"""
+
+    RENDER_MODE_SPLAT = "splat"
+    RENDER_MODE_POINTS = "points"
+    RENDER_MODE_LABELS = {
+        RENDER_MODE_SPLAT: "高斯",
+        RENDER_MODE_POINTS: "高斯点",
+    }
     
     def __init__(self, pc, bg_color=[0, 0, 0]):
         self.pc = pc
-        self.bg_color = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        self.bg_color = torch.tensor(bg_color, dtype=torch.float32, device=pc.get_xyz.device)
         self._means2d_buffer = None
         self._means2d_count = -1
+        self.render_mode = self.RENDER_MODE_SPLAT
+        self.point_size = 1.0
+        self.point_opacity = 1.0
+
+    def _device(self):
+        xyz = self.pc.get_xyz
+        if xyz is not None:
+            return xyz.device
+        return self.bg_color.device
+
+    def _background_color(self, device=None):
+        if device is None:
+            device = self._device()
+        if self.bg_color.device != device:
+            self.bg_color = self.bg_color.to(device=device)
+        return self.bg_color
+
+    def set_background_color(self, color):
+        self.bg_color = torch.tensor(color, dtype=torch.float32, device=self._device())
+
+    def set_render_mode(self, mode):
+        mode = str(mode).lower()
+        if mode not in self.RENDER_MODE_LABELS:
+            raise ValueError(f"不支持的渲染模式: {mode}")
+        self.render_mode = mode
+
+    def cycle_render_mode(self):
+        modes = [
+            self.RENDER_MODE_SPLAT,
+            self.RENDER_MODE_POINTS,
+        ]
+        next_idx = (modes.index(self.render_mode) + 1) % len(modes)
+        self.render_mode = modes[next_idx]
+        return self.render_mode
+
+    def set_point_style(self, size=None, opacity=None):
+        if size is not None:
+            self.point_size = max(0.1, float(size))
+        if opacity is not None:
+            self.point_opacity = max(0.05, min(float(opacity), 1.0))
+
+    def get_render_mode_label(self):
+        return self.RENDER_MODE_LABELS.get(self.render_mode, self.render_mode)
     
     def _get_screenspace_buffer(self):
         point_count = self.pc.get_xyz.shape[0]
@@ -2622,8 +2689,7 @@ class GaussianRenderer:
             self._means2d_buffer.zero_()
         return self._means2d_buffer
         
-    def render(self, camera, resolution_scale=1.0):
-        """渲染一帧"""
+    def _render_gaussians(self, camera, resolution_scale=1.0):
         with torch.inference_mode():
             cam = camera.get_camera()
             scale = float(max(0.1, min(resolution_scale, 1.0)))
@@ -2631,13 +2697,14 @@ class GaussianRenderer:
             image_height = max(1, int(round(cam.image_height * scale)))
             
             screenspace_points = self._get_screenspace_buffer()
+            bg = self._background_color(screenspace_points.device)
             
             raster_settings = GaussianRasterizationSettings(
                 image_height=image_height,
                 image_width=image_width,
                 tanfovx=math.tan(cam.FoVx * 0.5),
                 tanfovy=math.tan(cam.FoVy * 0.5),
-                bg=self.bg_color,
+                bg=bg,
                 scale_modifier=1.0,
                 viewmatrix=cam.world_view_transform,
                 projmatrix=cam.full_proj_transform,
@@ -2669,6 +2736,64 @@ class GaussianRenderer:
                 rendered_image, radii, depth = result
             
             return rendered_image.clamp(0, 1)
+
+    def _render_points(self, camera, resolution_scale=1.0):
+        with torch.inference_mode():
+            cam = camera.get_camera()
+            scale = float(max(0.1, min(resolution_scale, 1.0)))
+            image_width = max(1, int(round(cam.image_width * scale)))
+            image_height = max(1, int(round(cam.image_height * scale)))
+            device = self._device()
+            xyz = self.pc.get_xyz
+            if xyz is None or xyz.numel() == 0:
+                return torch.zeros((3, image_height, image_width), dtype=torch.float32, device=device)
+
+            screenspace_points = self._get_screenspace_buffer()
+            bg = self._background_color(device)
+            colors_precomp = torch.clamp(self.pc.get_features[:, 0, :] * SH_C0 + 0.5, 0.0, 1.0)
+            opacities = (self.pc.get_opacity * self.point_opacity).clamp(0.0, 1.0)
+            scales = self.pc.get_scaling * self.point_size
+
+            raster_settings = GaussianRasterizationSettings(
+                image_height=image_height,
+                image_width=image_width,
+                tanfovx=math.tan(cam.FoVx * 0.5),
+                tanfovy=math.tan(cam.FoVy * 0.5),
+                bg=bg,
+                scale_modifier=1.0,
+                viewmatrix=cam.world_view_transform,
+                projmatrix=cam.full_proj_transform,
+                sh_degree=0,
+                campos=cam.camera_center,
+                prefiltered=False,
+                debug=False,
+                antialiasing=False
+            )
+
+            rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+            result = rasterizer(
+                means3D=xyz,
+                means2D=screenspace_points,
+                shs=None,
+                colors_precomp=colors_precomp,
+                opacities=opacities,
+                scales=scales,
+                rotations=self.pc.get_rotation,
+                cov3D_precomp=None
+            )
+
+            if len(result) == 2:
+                rendered_image, _radii = result
+            else:
+                rendered_image, _radii, _depth = result
+            return rendered_image.clamp(0, 1)
+
+    def render(self, camera, resolution_scale=1.0):
+        """渲染一帧"""
+        if self.render_mode == self.RENDER_MODE_SPLAT:
+            return self._render_gaussians(camera, resolution_scale=resolution_scale)
+
+        return self._render_points(camera, resolution_scale=resolution_scale)
 
 
 class PygameViewer:

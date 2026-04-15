@@ -3,14 +3,15 @@
 4DGS Interactive Player — Qt UI 交互式播放器
 
 用法:
-    python player.py /home/lf/algorithm/3dgs/3dgsalgotithm/CodeReading/gaussian-splatting/output/coffee_martini/outpyt1/global_per_frame_ply
+    python player.py /home/lf/algorithm/3dgs/3dgsalgotithm/CodeReading/gaussian-splatting/output/douyinhuaban/output01/global_per_frame_ply
     python player.py data/1/window_000/per_frame_ply --render-resolution 4k --playback-fps 30
     python player.py data/1/window_000/per_frame_ply --load-mode stream --gpu-cache-size 4
     python player.py point_cloud.ply --render-resolution 2k
-python player.py /home/lf/algorithm/3dgs/3dgsalgotithm/CodeReading/gaussian-splatting/output/coffee_martini/outpyt1/global_per_frame_ply --cache-overwrite
+    python player.py <sequence_dir> --sparse data/sparse  # 加载 COLMAP 真实相机位姿
 
 快捷键:
     1/2/3/4      - 切换渲染分辨率 (720p/1080p/2K/4K)
+    G            - 切换显示模式 (高斯 / 点)
     W/A/S/D      - 相机平移
     Q/E          - 上下
     I/K/J/L      - 旋转
@@ -21,6 +22,9 @@ python player.py /home/lf/algorithm/3dgs/3dgsalgotithm/CodeReading/gaussian-spla
     -/+          - 调整播放FPS
     Y            - 切换 Trackball 模式
     B            - 切换 Orbit 模式
+    N            - 下一个相机位姿
+    P            - 跳转到最近的相机位姿
+    R            - 重置相机
     M            - 截图
     F11          - 全屏
     Esc          - 退出
@@ -88,17 +92,21 @@ RESOLUTION_OPTIONS = [
 ]
 
 FPS_PRESETS = [10, 15, 24, 30, 60, 120]
+DISPLAY_MODE_OPTIONS = [
+    ("高斯", GaussianRenderer.RENDER_MODE_SPLAT),
+    ("点模式", GaussianRenderer.RENDER_MODE_POINTS),
+]
+
+
+def _recommended_io_workers() -> int:
+    cpu_count = os.cpu_count() or 4
+    return max(4, min(8, cpu_count))
 
 CAMERA_MOTION_KEYS = {
     Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D,
     Qt.Key_Q, Qt.Key_E, Qt.Key_I, Qt.Key_K,
     Qt.Key_J, Qt.Key_L, Qt.Key_U, Qt.Key_O,
 }
-
-
-def _recommended_io_workers() -> int:
-    cpu_count = os.cpu_count() or 8
-    return max(4, min(8, cpu_count))
 
 PLAYER_QSS = """
 QMainWindow, QWidget#CentralShell {
@@ -446,6 +454,7 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._connect()
         self._sync_resolution_combo()
+        self._sync_display_mode_combo()
         self._install_shortcuts()
         self._apply_window_theme()
         self._apply_initial_window_size()
@@ -515,6 +524,26 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        tb.addWidget(self._lbl(" 显示:"))
+        self.display_combo = QComboBox()
+        for label, _mode in DISPLAY_MODE_OPTIONS:
+            self.display_combo.addItem(label)
+        self.display_combo.setFixedWidth(96)
+        self.display_combo.setToolTip("切换高斯 / 点模式 (G)")
+        tb.addWidget(self.display_combo)
+
+        tb.addWidget(self._lbl(" 点大小:"))
+        self.point_size_spin = QDoubleSpinBox()
+        self.point_size_spin.setRange(0.25, 4.0)
+        self.point_size_spin.setSingleStep(0.25)
+        self.point_size_spin.setDecimals(2)
+        self.point_size_spin.setValue(getattr(self.renderer, "point_size", 1.0))
+        self.point_size_spin.setFixedWidth(62)
+        self.point_size_spin.setToolTip("点模式下的高斯尺寸倍率")
+        tb.addWidget(self.point_size_spin)
+
+        tb.addSeparator()
+
         # 相机模式
         tb.addWidget(self._lbl(" 相机模式:"))
         self.mode_combo = QComboBox()
@@ -580,7 +609,7 @@ class MainWindow(QMainWindow):
         hint_row = QHBoxLayout()
         hint_row.setContentsMargins(0, 0, 0, 0)
         hint_row.addStretch()
-        hint = QLabel("Space 播放/暂停   Esc 关闭   ←/→ 切帧")
+        hint = QLabel("Space 播放/暂停   G 显示模式   Esc 关闭   ←/→ 切帧")
         hint.setObjectName("ShortcutHint")
         hint_row.addWidget(hint)
         view_layout.addLayout(hint_row)
@@ -702,6 +731,7 @@ class MainWindow(QMainWindow):
             self._register_shortcut(Qt.Key_Plus, lambda: self._adj_fps(+5.0))
         self._register_shortcut(Qt.Key_Escape, self.close)
         self._register_shortcut(Qt.Key_F11, self._toggle_fullscreen)
+        self._register_shortcut(Qt.Key_G, self._cycle_display_mode)
         self._register_shortcut(Qt.Key_M, self._screenshot)
         self._register_shortcut(Qt.Key_Y, self._shortcut_trackball)
         self._register_shortcut(Qt.Key_B, self._shortcut_orbit)
@@ -721,6 +751,17 @@ class MainWindow(QMainWindow):
     def _shortcut_orbit(self):
         self.camera.switch_mode(InteractiveCamera.MODE_ORBIT)
         self.mode_combo.setCurrentIndex(2)
+        self._request_render()
+
+    def _cycle_display_mode(self):
+        mode = self.renderer.cycle_render_mode()
+        for idx, (_label, option_mode) in enumerate(DISPLAY_MODE_OPTIONS):
+            if option_mode == mode:
+                self.display_combo.blockSignals(True)
+                self.display_combo.setCurrentIndex(idx)
+                self.display_combo.blockSignals(False)
+                break
+        self.statusBar().showMessage(f"显示模式: {self.renderer.get_render_mode_label()}", 2500)
         self._request_render()
 
     def _shortcut_resolution(self, idx: int):
@@ -762,6 +803,8 @@ class MainWindow(QMainWindow):
     def _connect(self):
         self.res_combo.currentIndexChanged.connect(self._on_res_changed)
         self.bg_combo.currentIndexChanged.connect(self._on_bg_changed)
+        self.display_combo.currentIndexChanged.connect(self._on_display_mode_changed)
+        self.point_size_spin.valueChanged.connect(self._on_point_size_changed)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         
         if self.camera_combo:
@@ -847,6 +890,7 @@ class MainWindow(QMainWindow):
         r_str = f"{self.render_w}×{self.render_h}"
         w_str = f"{self.view.width()}×{self.view.height()}"
         parts = [f"渲染: {r_str}", f"窗口: {w_str}", f"Viewer FPS: {self._fps_avg:.1f}"]
+        parts.append(f"显示: {self.renderer.get_render_mode_label()}")
 
         if self.seq:
             f = self.seq.current_frame + 1
@@ -946,9 +990,30 @@ class MainWindow(QMainWindow):
                 return
         self.res_combo.setCurrentIndex(0)
 
+    def _sync_display_mode_combo(self):
+        current_mode = getattr(self.renderer, "render_mode", GaussianRenderer.RENDER_MODE_SPLAT)
+        for idx, (_label, mode) in enumerate(DISPLAY_MODE_OPTIONS):
+            if mode == current_mode:
+                self.display_combo.blockSignals(True)
+                self.display_combo.setCurrentIndex(idx)
+                self.display_combo.blockSignals(False)
+                return
+        self.display_combo.setCurrentIndex(0)
+
     def _on_bg_changed(self, idx):
         color = [1.0, 1.0, 1.0] if idx else [0.0, 0.0, 0.0]
-        self.renderer.bg_color = torch.tensor(color, dtype=torch.float32, device="cuda")
+        self.renderer.set_background_color(color)
+        self._request_render()
+
+    def _on_display_mode_changed(self, idx):
+        if 0 <= idx < len(DISPLAY_MODE_OPTIONS):
+            _label, mode = DISPLAY_MODE_OPTIONS[idx]
+            self.renderer.set_render_mode(mode)
+            self.statusBar().showMessage(f"显示模式: {self.renderer.get_render_mode_label()}", 2500)
+            self._request_render()
+
+    def _on_point_size_changed(self, value):
+        self.renderer.set_point_style(size=value)
         self._request_render()
 
     def _on_mode_changed(self, idx):
@@ -990,7 +1055,6 @@ class MainWindow(QMainWindow):
                 self.camera_combo.setCurrentIndex(self.camera.current_camera_idx + 1)
                 self.camera_combo.blockSignals(False)
             self._request_render()
-
 
     def _on_play_toggled(self, checked: bool):
         if self.seq:
@@ -1071,13 +1135,25 @@ class MainWindow(QMainWindow):
 &nbsp;&nbsp;&nbsp;&nbsp;工具栏下拉菜单 — 任意预设<br>
 &nbsp;&nbsp;&nbsp;&nbsp;窗口边框可自由拖动，不影响渲染分辨率<br><br>
 
+<b>显示模式</b><br>
+&nbsp;&nbsp;&nbsp;&nbsp;<b>G</b> — 高斯 / 点模式 循环切换<br>
+&nbsp;&nbsp;&nbsp;&nbsp;工具栏显示下拉框 — 直接切换显示方式<br>
+&nbsp;&nbsp;&nbsp;&nbsp;工具栏点大小 — 调整点模式下的高斯尺寸倍率<br><br>
+
 <b>相机移动 (FPS 模式)</b><br>
 &nbsp;&nbsp;&nbsp;&nbsp;<b>W/S</b> — 前进 / 后退 &nbsp; <b>A/D</b> — 左移 / 右移 &nbsp; <b>Q/E</b> — 下 / 上<br>
 &nbsp;&nbsp;&nbsp;&nbsp;<b>I/K</b> — 俯仰 &nbsp; <b>J/L</b> — 偏航 &nbsp; <b>U/O</b> — 滚转<br>
 &nbsp;&nbsp;&nbsp;&nbsp;鼠标左键拖动 — 横向平移<br>
 &nbsp;&nbsp;&nbsp;&nbsp;鼠标右键拖动 — 纵向平移<br>
 &nbsp;&nbsp;&nbsp;&nbsp;鼠标中键拖动 / 滚轮 — 缩放<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>Y</b> — Trackball 模式 &nbsp; <b>B</b> — Orbit 模式<br><br>
+&nbsp;&nbsp;&nbsp;&nbsp;<b>Y</b> — Trackball 模式 &nbsp; <b>B</b> — Orbit 模式<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<b>R</b> — 重置相机到初始位置<br><br>
+
+<b>真实相机位姿切换</b><br>
+&nbsp;&nbsp;&nbsp;&nbsp;<b>N</b> — 下一个相机位姿<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<b>P</b> — 跳转到最近的相机位姿<br>
+&nbsp;&nbsp;&nbsp;&nbsp;工具栏下拉菜单 — 直接选择特定相机<br>
+&nbsp;&nbsp;&nbsp;&nbsp;使用 --sparse 参数加载 COLMAP 数据<br><br>
 
 <b>序列播放</b><br>
 &nbsp;&nbsp;&nbsp;&nbsp;<b>空格</b> — 播放 / 暂停<br>
@@ -1140,11 +1216,36 @@ def _build_objects(args):
                 print(f"检测到序列目录: {input_path}  共 {len(ply_files)} 帧")
                 sequence_dir = input_path
                 ply_path     = os.path.join(input_path, ply_files[0])
-            elif os.path.exists(os.path.join(input_path, "cfg_args")):
-                config       = _core.parse_cfg_args(input_path)
-                pc_dir       = os.path.join(input_path, "point_cloud")
-                iter_dir     = _core.find_largest_iteration(pc_dir)
-                ply_path     = os.path.join(pc_dir, iter_dir, "point_cloud.ply")
+            else:
+                # 兼容上层目录输入：自动探测常见帧目录
+                nested_candidates = []
+                for rel in ("per_frame_ply", "global_per_frame_ply"):
+                    cand = os.path.join(input_path, rel)
+                    if os.path.isdir(cand):
+                        nested_candidates.append(cand)
+
+                window_dirs = sorted(
+                    d for d in os.listdir(input_path)
+                    if d.startswith("window_") and os.path.isdir(os.path.join(input_path, d))
+                )
+                for wd in window_dirs:
+                    cand = os.path.join(input_path, wd, "per_frame_ply")
+                    if os.path.isdir(cand):
+                        nested_candidates.append(cand)
+
+                for cand in nested_candidates:
+                    cand_ply_files = sorted(f for f in os.listdir(cand) if f.endswith('.ply'))
+                    if cand_ply_files:
+                        print(f"自动检测到序列目录: {cand}  共 {len(cand_ply_files)} 帧")
+                        sequence_dir = cand
+                        ply_path = os.path.join(cand, cand_ply_files[0])
+                        break
+
+                if ply_path is None and os.path.exists(os.path.join(input_path, "cfg_args")):
+                    config = _core.parse_cfg_args(input_path)
+                    pc_dir = os.path.join(input_path, "point_cloud")
+                    iter_dir = _core.find_largest_iteration(pc_dir)
+                    ply_path = os.path.join(pc_dir, iter_dir, "point_cloud.ply")
         elif input_path.endswith('.ply') and os.path.exists(input_path):
             ply_path = input_path
         else:
@@ -1157,6 +1258,13 @@ def _build_objects(args):
         ply_path = os.path.join(pc_dir, iter_dir, "point_cloud.ply")
     else:
         print("错误: 请指定序列目录或 PLY 文件"); sys.exit(1)
+
+    if ply_path is None:
+        print(
+            "错误: 在输入目录中未找到可播放的 PLY 帧。\n"
+            "请传入包含 .ply 的目录，或直接传入 data/.../global_per_frame_ply。"
+        )
+        sys.exit(1)
 
     if not os.path.exists(ply_path):
         print(f"错误: 找不到 '{ply_path}'"); sys.exit(1)
@@ -1190,18 +1298,14 @@ def _build_objects(args):
     # 序列管理器
     if sequence_dir:
         io_workers = _core.clamp_positive_int(getattr(args, 'io_workers', None), _recommended_io_workers())
-        gpu_cache_size = _core.clamp_positive_int(getattr(args, 'gpu_cache_size', 16), 16)
-        cpu_cache_size = _core.clamp_positive_int(getattr(args, 'cpu_cache_size', 10), 10)
-        default_prefetch = max(1, cpu_cache_size - 1)
-        prefetch_count = max(0, int(getattr(args, 'prefetch_count', default_prefetch)))
         seq_mgr = SequenceManager(
             sequence_dir,
             sh_degree     = sh_degree,
             playback_fps  = playback_fps,
             load_mode     = getattr(args, 'load_mode', SequenceManager.LOAD_MODE_AUTO),
-            gpu_cache_size= gpu_cache_size,
-            cpu_cache_size= cpu_cache_size,
-            prefetch_count= prefetch_count,
+            gpu_cache_size= _core.clamp_positive_int(getattr(args, 'gpu_cache_size',  4), 4),
+            cpu_cache_size= _core.clamp_positive_int(getattr(args, 'cpu_cache_size',  8), 8),
+            prefetch_count= max(0, int(getattr(args, 'prefetch_count', 2))),
             io_workers    = io_workers,
             pin_memory    = not getattr(args, 'no_pin_memory', False),
             max_gaussians = getattr(args, 'max_gaussians', None),
@@ -1229,6 +1333,11 @@ def _build_objects(args):
         camera.set_camera(0)
 
     renderer = GaussianRenderer(pc, bg_color=bg_color)
+    renderer.set_render_mode(getattr(args, 'display_mode', GaussianRenderer.RENDER_MODE_SPLAT))
+    renderer.set_point_style(
+        size=getattr(args, 'point_size', 1.0),
+        opacity=getattr(args, 'point_opacity', 1.0),
+    )
     return renderer, camera, seq_mgr, render_w, render_h
 
 
@@ -1252,6 +1361,10 @@ def main():
 
   # 单帧 PLY
   python player.py model/point_cloud/iteration_30000/point_cloud.ply --render-resolution 2k
+  
+  # 加载 COLMAP 真实相机位姿（可用 N/P 键切换）
+  python player.py data/sequence --sparse data/sparse
+  python player.py output/scene/point_cloud.ply --sparse colmap/sparse/0
 """,
     )
     parser.add_argument("input",              nargs="?", default=None,   help="PLY 文件或序列目录")
@@ -1267,17 +1380,21 @@ def main():
                                  SequenceManager.LOAD_MODE_STREAM,
                                  SequenceManager.LOAD_MODE_PRELOAD_CPU,
                                  SequenceManager.LOAD_MODE_PRELOAD_GPU])
-    parser.add_argument("--gpu-cache-size",   type=int, default=16,
-                        help="GPU热帧窗口大小，适合缓存当前帧及后续几帧")
-    parser.add_argument("--cpu-cache-size",   type=int, default=10,
-                        help="CPU前向滑动窗口大小，默认10帧")
-    parser.add_argument("--prefetch-count",   type=int, default=9,
-                        help="前向预读帧数，默认与CPU窗口匹配")
-    parser.add_argument("--io-workers",       type=int, default=None,
-                        help="后台缓存帧读取线程数，默认自动 4-8")
+    parser.add_argument("--gpu-cache-size",   type=int, default=10, help="GPU 缓存帧数 (适合小规模场景，减少加载卡顿)")
+    parser.add_argument("--cpu-cache-size",   type=int, default=30, help="CPU 缓存帧数 (适合大规模场景，减少加载卡顿)")
+    parser.add_argument("--prefetch-count",   type=int, default=30, help="预取帧数 (适合大规模场景，减少加载卡顿)")
+    parser.add_argument("--io-workers",       type=int, default=24, help="后台IO线程数 [默认: 自动 4-8]")
     parser.add_argument("--max-gaussians",    type=int, default=None,    help="每帧最多高斯点数（适合预览大规模场景）")
     parser.add_argument("--no-pin-memory",    action="store_true")
     parser.add_argument("--white_background","-w", action="store_true")
+    parser.add_argument(
+        "--display-mode",
+        default=GaussianRenderer.RENDER_MODE_SPLAT,
+        choices=[mode for _label, mode in DISPLAY_MODE_OPTIONS],
+        help="显示模式: splat / points [默认: splat]",
+    )
+    parser.add_argument("--point-size", type=float, default=1.0, help="点模式下的高斯尺寸倍率 [默认: 1.0]")
+    parser.add_argument("--point-opacity", type=float, default=1.0, help="点模式下的全局不透明度倍率 [默认: 1.0]")
 
     args = parser.parse_args()
 
