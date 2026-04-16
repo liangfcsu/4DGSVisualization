@@ -2694,6 +2694,7 @@ class GaussianRenderer:
         self.render_mode = self.RENDER_MODE_SPLAT
         self.point_size = 1.0
         self.point_opacity = 1.0
+        self.ring_size = 0.3
 
     def _device(self):
         xyz = self.pc.get_xyz
@@ -2781,9 +2782,8 @@ class GaussianRenderer:
                 if 'antialiasing' in GaussianRasterizationSettings._fields:
                     kwargs['antialiasing'] = False
                 if 'ring_mode' in GaussianRasterizationSettings._fields:
-                    kwargs['ring_mode'] = (self.render_mode == self.RENDER_MODE_RING)
-                elif self.render_mode == self.RENDER_MODE_RING:
-                    print("WARN: 您的 diff-gaussian-rasterization 版本不支持 ring_mode 物理空心环渲染，需重新编译 CUDA 插件。")
+                    kwargs['ring_mode'] = False
+                    kwargs['ring_size'] = 0.3
             
             raster_settings = GaussianRasterizationSettings(**kwargs)
             
@@ -2845,6 +2845,7 @@ class GaussianRenderer:
                     kwargs['antialiasing'] = False
                 if 'ring_mode' in GaussianRasterizationSettings._fields:
                     kwargs['ring_mode'] = False
+                    kwargs['ring_size'] = 0.3
             raster_settings = GaussianRasterizationSettings(**kwargs)
 
             rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -2865,9 +2866,73 @@ class GaussianRenderer:
                 rendered_image, _radii, _depth = result
             return rendered_image.clamp(0, 1)
 
+    def _render_ring(self, camera, resolution_scale=1.0):
+        """Ring 模式: 利用 CUDA rasterizer 原生 ring_mode 参数。
+        
+        在光栅化 fragment 阶段修改 alpha:
+        - power = -0.5 * (conic 二次型) → 归一化距离 A = -power/4
+        - 内部 (A < 1-ringSize): alpha = max(0.05, alpha) → 近乎透明
+        - 环带 (A >= 1-ringSize): alpha = 0.6 → 清晰可见
+        效果: 每个高斯显示为环形, 中心镂空, 边界清晰
+        """
+        with torch.inference_mode():
+            cam = camera.get_camera()
+            scale = float(max(0.1, min(resolution_scale, 1.0)))
+            image_width = max(1, int(round(cam.image_width * scale)))
+            image_height = max(1, int(round(cam.image_height * scale)))
+            device = self._device()
+            xyz = self.pc.get_xyz
+            if xyz is None or xyz.numel() == 0:
+                return torch.zeros((3, image_height, image_width), dtype=torch.float32, device=device)
+
+            bg = self._background_color(device)
+            screenspace = self._get_screenspace_buffer()
+
+            # 使用 SH 零阶近似颜色, 100% 不透明度以便 ring 效果清晰
+            colors_precomp = torch.clamp(self.pc.get_features[:, 0, :] * SH_C0 + 0.5, 0.0, 1.0)
+            opacities = torch.ones_like(self.pc.get_opacity)
+            scales = self.pc.get_scaling * self.point_size
+
+            raster_kwargs = {
+                'image_height': image_height,
+                'image_width': image_width,
+                'tanfovx': math.tan(cam.FoVx * 0.5),
+                'tanfovy': math.tan(cam.FoVy * 0.5),
+                'bg': bg,
+                'scale_modifier': 1.0,
+                'viewmatrix': cam.world_view_transform,
+                'projmatrix': cam.full_proj_transform,
+                'sh_degree': 0,
+                'campos': cam.camera_center,
+                'prefiltered': False,
+                'debug': False,
+                'ring_mode': True,
+                'ring_size': getattr(self, 'ring_size', 0.3),
+            }
+            if hasattr(GaussianRasterizationSettings, '_fields'):
+                if 'antialiasing' in GaussianRasterizationSettings._fields:
+                    raster_kwargs['antialiasing'] = False
+
+            raster_settings = GaussianRasterizationSettings(**raster_kwargs)
+            rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+            result = rasterizer(
+                means3D=xyz,
+                means2D=screenspace,
+                shs=None,
+                colors_precomp=colors_precomp,
+                opacities=opacities,
+                scales=scales,
+                rotations=self.pc.get_rotation,
+                cov3D_precomp=None,
+            )
+            rendered = result[0] if isinstance(result, tuple) else result
+            return rendered.clamp(0, 1)
+
     def render(self, camera, resolution_scale=1.0):
         """渲染一帧"""
-        if self.render_mode in (self.RENDER_MODE_SPLAT, self.RENDER_MODE_RING):
+        if self.render_mode == self.RENDER_MODE_RING:
+            return self._render_ring(camera, resolution_scale=resolution_scale)
+        if self.render_mode == self.RENDER_MODE_SPLAT:
             return self._render_gaussians(camera, resolution_scale=resolution_scale)
 
         return self._render_points(camera, resolution_scale=resolution_scale)

@@ -268,9 +268,15 @@ class RenderView(QWidget):
                 if ic: self.camera.trackball_pan(-dx, dy)
                 else:  self.camera.trackball_zoom(-dy * 0.5)
         else:
-            if self._left:  self.camera.move_right(dx * 0.1)
-            if self._right: self.camera.move_up(-dy * 0.1)
-            if self._mid:   self.camera.move_forward(-dy * 0.1)
+            # FPS / Orbit 模式: 左键旋转, 右键平移(抓取式), 中键前后
+            if self._left:
+                self.camera.rotate_yaw(dx * 0.3)
+                self.camera.rotate_pitch(-dy * 0.3)
+            if self._right:
+                self.camera.move_right(-dx * 0.1)
+                self.camera.move_up(dy * 0.1)
+            if self._mid:
+                self.camera.move_forward(-dy * 0.1)
 
         self._last_pos = e.pos()
         if self._interaction_callback:
@@ -473,6 +479,13 @@ class MainWindow(QMainWindow):
         self.top_bar.sync_camera_mode(self.ui_state.camera_mode)
         self.left_panel.sync_resolution(self.render_w, self.render_h)
         self.left_panel.sync_point_size(self.ui_state.point_size)
+        # Sync camera params
+        self.left_panel.move_speed_spin.blockSignals(True)
+        self.left_panel.move_speed_spin.setValue(self.camera.move_speed)
+        self.left_panel.move_speed_spin.blockSignals(False)
+        self.left_panel.rot_speed_spin.blockSignals(True)
+        self.left_panel.rot_speed_spin.setValue(self.camera.rot_speed)
+        self.left_panel.rot_speed_spin.blockSignals(False)
         self.overlay.sync_vis_mode(self.ui_state.vis_mode)
         self.overlay.update_scene_label(
             self.ui_state.scene_name, self.ui_state.vis_mode, self.ui_state.camera_mode
@@ -486,6 +499,7 @@ class MainWindow(QMainWindow):
         # ── TopBar ──
         self.top_bar.vis_mode_changed.connect(self._set_vis_mode)
         self.top_bar.camera_mode_changed.connect(self._set_camera_mode)
+        self.top_bar.project_mode_changed.connect(self._on_project_mode_changed)
         self.top_bar.reset_clicked.connect(self._reset_camera)
         self.top_bar.screenshot_clicked.connect(self._screenshot)
         self.top_bar.fullscreen_clicked.connect(self._toggle_fullscreen)
@@ -506,6 +520,8 @@ class MainWindow(QMainWindow):
         self.left_panel.camera_mode_changed.connect(self._set_camera_mode)
         self.left_panel.camera_selected.connect(self._on_camera_selected)
         self.left_panel.fov_changed.connect(self._on_fov_changed)
+        self.left_panel.move_speed_changed.connect(self._on_move_speed_changed)
+        self.left_panel.rot_speed_changed.connect(self._on_rot_speed_changed)
         self.left_panel.reset_camera_clicked.connect(self._reset_camera)
         self.left_panel.layer_changed.connect(self._on_layer_changed)
         self.left_panel.debug_changed.connect(self._on_debug_changed)
@@ -520,6 +536,7 @@ class MainWindow(QMainWindow):
             self.bottom_bar.seek_moved.connect(self._on_seek_moved)
             self.bottom_bar.seek_released.connect(self._on_seek_released)
             self.bottom_bar.fps_changed.connect(lambda v: (self.seq.set_fps(v), self._request_render()))
+            self.bottom_bar.loop_toggled.connect(self._on_loop_toggled)
 
         # ── Viewport Overlay ──
         self.overlay.quick_vis_mode_clicked.connect(self._set_vis_mode)
@@ -872,6 +889,24 @@ class MainWindow(QMainWindow):
         self._set_last_event(f"FOV: {value_deg:.0f}°")
         self._request_render()
 
+    def _on_move_speed_changed(self, value: float):
+        self.camera.move_speed = value
+        self._set_last_event(f"移动速度: {value:.3f}")
+
+    def _on_rot_speed_changed(self, value: float):
+        self.camera.rot_speed = value
+        self._set_last_event(f"旋转速度: {value:.3f}")
+
+    def _on_project_mode_changed(self, mode: str):
+        self.ui_state.project_mode = mode
+        self._set_last_event(f"项目模式: {mode}")
+
+    def _on_loop_toggled(self, enabled: bool):
+        self.ui_state.loop_enabled = enabled
+        if self.seq:
+            self.seq.loop = enabled
+        self._set_last_event(f"循环播放: {'ON' if enabled else 'OFF'}")
+
     def _on_gaussian_vis(self, key: str, enabled: bool):
         """Handle Gaussian visualization toggles — map to render mode if applicable."""
         if key == "pointcloud" and enabled:
@@ -1064,6 +1099,16 @@ class MainWindow(QMainWindow):
 
 <b>显示模式</b><br>
 &nbsp;&nbsp;<b>G</b> — 循环切换 (RGB / Gaussian / Ring)<br><br>
+
+<b>鼠标操作 (FPS/Orbit 模式)</b><br>
+&nbsp;&nbsp;<b>左键拖动</b> — 旋转视角<br>
+&nbsp;&nbsp;<b>右键拖动</b> — 平移<br>
+&nbsp;&nbsp;<b>中键拖动</b> — 前后移动<br>
+&nbsp;&nbsp;<b>滚轮</b> — 缩放<br><br>
+
+<b>鼠标操作 (Trackball 模式)</b><br>
+&nbsp;&nbsp;<b>左键中心</b> — 球面旋转 &nbsp; <b>左键边缘</b> — 滚转<br>
+&nbsp;&nbsp;<b>右键中心</b> — 平移 &nbsp; <b>右键边缘</b> — 缩放<br><br>
 
 <b>相机移动</b><br>
 &nbsp;&nbsp;<b>W/S</b> 前后 &nbsp; <b>A/D</b> 左右 &nbsp; <b>Q/E</b> 上下<br>

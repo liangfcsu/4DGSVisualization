@@ -33,6 +33,8 @@ class LeftControlPanel(QWidget):
     camera_mode_changed     = pyqtSignal(str)
     camera_selected         = pyqtSignal(int)
     fov_changed             = pyqtSignal(float)
+    move_speed_changed      = pyqtSignal(float)
+    rot_speed_changed       = pyqtSignal(float)
     reset_camera_clicked    = pyqtSignal()
     layer_changed           = pyqtSignal(str, bool)
     debug_changed           = pyqtSignal(str, bool)
@@ -233,6 +235,32 @@ class LeftControlPanel(QWidget):
         self.fov_spin.valueChanged.connect(lambda v: self.fov_changed.emit(v))
         row.addWidget(self.fov_spin)
         cl.addLayout(row)
+
+        # Move speed
+        row_ms = QHBoxLayout()
+        row_ms.addWidget(self._lbl("移动速度"))
+        self.move_speed_spin = QDoubleSpinBox()
+        self.move_speed_spin.setRange(0.001, 10.0)
+        self.move_speed_spin.setSingleStep(0.1)
+        self.move_speed_spin.setDecimals(3)
+        self.move_speed_spin.setValue(0.5)
+        self.move_speed_spin.setToolTip("相机移动速度")
+        self.move_speed_spin.valueChanged.connect(lambda v: self.move_speed_changed.emit(v))
+        row_ms.addWidget(self.move_speed_spin)
+        cl.addLayout(row_ms)
+
+        # Rotation speed
+        row_rs = QHBoxLayout()
+        row_rs.addWidget(self._lbl("旋转速度"))
+        self.rot_speed_spin = QDoubleSpinBox()
+        self.rot_speed_spin.setRange(0.001, 0.5)
+        self.rot_speed_spin.setSingleStep(0.005)
+        self.rot_speed_spin.setDecimals(3)
+        self.rot_speed_spin.setValue(0.02)
+        self.rot_speed_spin.setToolTip("相机旋转速度")
+        self.rot_speed_spin.valueChanged.connect(lambda v: self.rot_speed_changed.emit(v))
+        row_rs.addWidget(self.rot_speed_spin)
+        cl.addLayout(row_rs)
 
         # Camera pose selector
         if self.cameras_info and len(self.cameras_info) > 0:

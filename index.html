@@ -1,0 +1,2081 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CSU336 Gaussian Splatting Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #111; overflow: hidden; font-family: system-ui, -apple-system, sans-serif; }
+canvas { display: block; width: 100vw; height: 100vh; }
+#ui {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    display: flex; gap: 10px; align-items: center;
+}
+.btn {
+    padding: 6px 14px; background: rgba(255,255,255,0.1); color: #ccc;
+    border: 1px solid rgba(255,255,255,0.2); border-radius: 6px;
+    cursor: pointer; font-size: 13px; backdrop-filter: blur(8px);
+    transition: background 0.2s;
+}
+.btn:hover { background: rgba(255,255,255,0.25); color: #fff; }
+.btn.active { background: rgba(100,180,255,0.35); color: #fff; border-color: rgba(100,180,255,0.6); }
+.slider-group {
+    display: none; align-items: center; gap: 6px;
+    color: #aaa; font-size: 12px; background: rgba(0,0,0,0.4);
+    padding: 4px 10px; border-radius: 6px; backdrop-filter: blur(8px);
+}
+.slider-group.visible { display: flex; }
+.slider-group input[type=range] {
+    width: 90px; accent-color: #6ab4ff; cursor: pointer;
+}
+.slider-group .val { min-width: 28px; text-align: right; color: #ccc; }
+#info {
+    color: rgba(255,255,255,0.5); font-size: 12px;
+    background: rgba(0,0,0,0.5); padding: 4px 10px; border-radius: 4px;
+}
+#cam-nav {
+    display: none; align-items: center; gap: 4px;
+    background: rgba(0,0,0,0.4); padding: 3px 8px; border-radius: 6px;
+    backdrop-filter: blur(8px);
+}
+#cam-nav.visible { display: flex; }
+#cam-nav .btn { padding: 4px 10px; font-size: 13px; min-width: 28px; text-align: center; }
+#cam-nav .cam-label { color: #ccc; font-size: 12px; min-width: 24px; text-align: center; cursor: default; }
+#drop-overlay {
+    position: fixed; inset: 0; z-index: 100; display: none;
+    background: rgba(0,0,0,0.75); justify-content: center; align-items: center;
+    color: #fff; font-size: 22px; letter-spacing: 1px;
+}
+#drop-overlay.active { display: flex; }
+#loading {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    color: #fff; font-size: 15px; display: none; z-index: 50;
+    background: rgba(0,0,0,0.7); padding: 12px 24px; border-radius: 8px;
+}
+#play-bar {
+    display: none; align-items: center; gap: 6px;
+    background: rgba(0,0,0,0.5); padding: 4px 10px; border-radius: 6px;
+    backdrop-filter: blur(8px); color: #ccc; font-size: 12px;
+}
+#play-bar.visible { display: flex; }
+#play-bar input[type=range] { width: 120px; accent-color: #6ab4ff; cursor: pointer; }
+#play-bar .val { min-width: 60px; text-align: center; color: #ccc; }
+#fps-slider-group {
+    display: flex; align-items: center; gap: 4px;
+    color: #aaa; font-size: 12px;
+}
+#fps-slider-group input[type=range] { width: 70px; accent-color: #6ab4ff; }
+
+/* Progress overlay */
+#progress-overlay {
+    position: fixed; inset: 0; z-index: 200;
+    display: none; flex-direction: column;
+    justify-content: center; align-items: center;
+    background: rgba(0,0,0,0.88);
+    backdrop-filter: blur(16px);
+}
+#progress-overlay.active { display: flex; animation: progFadeIn 0.4s ease; }
+#progress-overlay.hiding { animation: progFadeOut 0.6s ease forwards; pointer-events: none; }
+@keyframes progFadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes progFadeOut { from { opacity: 1; } to { opacity: 0; } }
+.prog-box {
+    width: 420px; max-width: 85vw; text-align: center;
+}
+.prog-icon {
+    font-size: 36px; margin-bottom: 14px; display: inline-block;
+    animation: progFloat 3s ease-in-out infinite;
+    filter: drop-shadow(0 0 12px rgba(106,180,255,0.5));
+    color: #6ab4ff;
+}
+@keyframes progFloat {
+    0%, 100% { transform: translateY(0) rotate(0deg); }
+    25% { transform: translateY(-6px) rotate(5deg); }
+    75% { transform: translateY(2px) rotate(-3deg); }
+}
+.prog-title {
+    color: #fff; font-size: 15px; margin-bottom: 16px;
+    font-weight: 400; letter-spacing: 0.3px;
+}
+.prog-filename {
+    color: #6ab4ff; font-size: 11px; margin-bottom: 12px;
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    opacity: 0.7; word-break: break-all;
+    max-width: 100%; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+}
+.prog-track {
+    width: 100%; height: 4px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 2px; overflow: hidden;
+}
+.prog-fill {
+    height: 100%; width: 0%;
+    border-radius: 2px;
+    background: linear-gradient(90deg, #3a8eef, #6ab4ff, #9dd1ff, #6ab4ff, #3a8eef);
+    background-size: 300% 100%;
+    transition: width 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+    animation: progShimmer 2s linear infinite;
+    box-shadow: 0 0 10px rgba(106,180,255,0.3);
+}
+@keyframes progShimmer {
+    0% { background-position: 300% 0; }
+    100% { background-position: -300% 0; }
+}
+.prog-fill.indeterminate {
+    width: 30% !important;
+    animation: progShimmer 2s linear infinite, progSlide 1.6s ease-in-out infinite;
+}
+@keyframes progSlide {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(440%); }
+}
+.prog-fill.parsing {
+    width: 100% !important;
+    animation: progShimmer 1.2s linear infinite, progPulse 1s ease-in-out infinite;
+}
+@keyframes progPulse {
+    0%, 100% { opacity: 0.5; box-shadow: 0 0 8px rgba(106,180,255,0.2); }
+    50% { opacity: 1; box-shadow: 0 0 16px rgba(106,180,255,0.5); }
+}
+.prog-meta {
+    display: flex; justify-content: space-between;
+    margin-top: 10px; font-size: 12px;
+}
+.prog-pct { color: #ddd; font-variant-numeric: tabular-nums; }
+.prog-size { color: rgba(255,255,255,0.35); font-variant-numeric: tabular-nums; }
+.prog-status {
+    color: rgba(255,255,255,0.3); font-size: 11px; margin-top: 14px;
+    min-height: 14px;
+}
+.prog-steps {
+    display: flex; justify-content: center; gap: 8px; margin-top: 18px;
+}
+.prog-step {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: rgba(255,255,255,0.15); transition: all 0.4s ease;
+}
+.prog-step.active { background: #6ab4ff; box-shadow: 0 0 8px rgba(106,180,255,0.6); }
+.prog-step.done { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.4); }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="ui">
+    <button class="btn" id="loadBtn">Open .ply / .splat</button>
+    <button class="btn" id="loadCamBtn">Load Cameras</button>
+    <button class="btn" id="ringBtn">Ring Mode</button>
+    <div class="slider-group" id="ringSizeGroup">
+        <span>Size</span>
+        <input type="range" id="ringSizeSlider" min="0.05" max="0.95" step="0.05" value="0.3">
+        <span class="val" id="ringSizeVal">0.3</span>
+    </div>
+    <button class="btn" id="pointsBtn">Points Mode</button>
+    <div class="slider-group" id="pointSizeGroup">
+        <span>Size</span>
+        <input type="range" id="pointSizeSlider" min="1" max="20" step="0.5" value="3">
+        <span class="val" id="pointSizeVal">3.0</span>
+    </div>
+    <span id="info">Drag & drop or click to load a 3DGS file</span>
+    <div id="play-bar">
+        <button class="btn" id="playBtn">&#9654;</button>
+        <input type="range" id="frameSlider" min="0" max="0" step="1" value="0">
+        <span class="val" id="frameLabel">0 / 0</span>
+        <div id="fps-slider-group">
+            <span>FPS:</span>
+            <input type="range" id="fpsSlider" min="1" max="60" step="1" value="24">
+            <span id="fpsVal">24</span>
+        </div>
+    </div>
+    <div id="cam-nav">
+        <button class="btn" id="camPrevBtn">&minus;</button>
+        <span class="cam-label" id="camLabel">1</span>
+        <button class="btn" id="camNextBtn">+</button>
+    </div>
+</div>
+<div id="drop-overlay">Drop .ply / .splat / images.txt file here</div>
+<div id="loading" id="loading">Loading...</div>
+<div id="progress-overlay">
+    <div class="prog-box">
+        <div class="prog-icon">&#10022;</div>
+        <div class="prog-title" id="prog-title">Loading Gaussian Splatting Data</div>
+        <div class="prog-filename" id="prog-filename"></div>
+        <div class="prog-track"><div class="prog-fill" id="prog-fill"></div></div>
+        <div class="prog-meta">
+            <span class="prog-pct" id="prog-pct">0%</span>
+            <span class="prog-size" id="prog-size"></span>
+        </div>
+        <div class="prog-status" id="prog-status"></div>
+        <div class="prog-steps">
+            <div class="prog-step" id="step0"></div>
+            <div class="prog-step" id="step1"></div>
+            <div class="prog-step" id="step2"></div>
+        </div>
+    </div>
+</div>
+<input type="file" id="fileInput" accept=".ply,.splat" hidden multiple>
+<input type="file" id="camFileInput" accept=".txt" hidden>
+
+<script>
+// =============================================================================
+// Inline Sort Worker
+// =============================================================================
+const SORT_WORKER_SRC = `
+let cachedPositions = null;
+let cachedCount = 0;
+
+self.onmessage = function(e) {
+    const { viewMatrix, positions, count } = e.data;
+
+    // Cache positions reference if sent
+    if (positions) {
+        cachedPositions = positions;
+        cachedCount = count;
+    }
+
+    const pos = cachedPositions;
+    const n = cachedCount;
+    if (!pos || n === 0) return;
+    const depths = new Float32Array(n);
+
+    // Compute view-space depth for each Gaussian
+    const vx = viewMatrix[2], vy = viewMatrix[6], vz = viewMatrix[10], vw = viewMatrix[14];
+    for (let i = 0; i < n; i++) {
+        const i3 = i * 3;
+        depths[i] = vx * pos[i3] + vy * pos[i3+1] + vz * pos[i3+2] + vw;
+    }
+
+    // Find depth range
+    let minD = 1e20, maxD = -1e20;
+    for (let i = 0; i < n; i++) {
+        const d = depths[i];
+        if (d < minD) minD = d;
+        if (d > maxD) maxD = d;
+    }
+
+    const range = maxD - minD;
+    const sorted = new Uint32Array(n);
+
+    if (range < 1e-8) {
+        for (let i = 0; i < n; i++) sorted[i] = i;
+    } else {
+        // 16-bit counting sort (65536 buckets)
+        const B = 65536;
+        const counts = new Uint32Array(B);
+        const inv = (B - 1) / range;
+
+        for (let i = 0; i < n; i++) {
+            counts[((depths[i] - minD) * inv) | 0]++;
+        }
+        // Prefix sum
+        let total = 0;
+        for (let i = 0; i < B; i++) {
+            const c = counts[i];
+            counts[i] = total;
+            total += c;
+        }
+        for (let i = 0; i < n; i++) {
+            const b = ((depths[i] - minD) * inv) | 0;
+            sorted[counts[b]++] = i;
+        }
+    }
+    self.postMessage({ indices: sorted }, [sorted.buffer]);
+};`;
+
+// =============================================================================
+// Math Utilities (minimal mat4/vec3)
+// =============================================================================
+const Mat4 = {
+    create() { const m = new Float32Array(16); m[0]=m[5]=m[10]=m[15]=1; return m; },
+
+    // In-place perspective: writes into existing buffer `out`
+    perspectiveTo(out, fov, aspect, near, far) {
+        out.fill(0);
+        const f = 1.0 / Math.tan(fov / 2);
+        const nf = 1 / (near - far);
+        out[0] = f / aspect; out[5] = f;
+        out[10] = (far + near) * nf; out[11] = -1;
+        out[14] = 2 * far * near * nf;
+        return out;
+    },
+
+    // In-place lookAt: writes into existing buffer `out`
+    lookAtTo(out, eye, target, up) {
+        let zx = eye[0]-target[0], zy = eye[1]-target[1], zz = eye[2]-target[2];
+        let len = Math.sqrt(zx*zx+zy*zy+zz*zz);
+        if (len > 0) { zx/=len; zy/=len; zz/=len; }
+        let xx = up[1]*zz - up[2]*zy, xy = up[2]*zx - up[0]*zz, xz = up[0]*zy - up[1]*zx;
+        len = Math.sqrt(xx*xx+xy*xy+xz*xz);
+        if (len > 0) { xx/=len; xy/=len; xz/=len; }
+        let yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+        out[0]=xx; out[1]=yx; out[2]=zx; out[3]=0;
+        out[4]=xy; out[5]=yy; out[6]=zy; out[7]=0;
+        out[8]=xz; out[9]=yz; out[10]=zz; out[11]=0;
+        out[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+        out[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+        out[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+        out[15]=1;
+        return out;
+    }
+};
+
+// =============================================================================
+// Quaternion Utilities
+// =============================================================================
+const Quat = {
+    create() { return new Float32Array([0, 0, 0, 1]); }, // (x, y, z, w)
+    copy(out, a) { out[0]=a[0]; out[1]=a[1]; out[2]=a[2]; out[3]=a[3]; return out; },
+    dot(a, b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3]; },
+
+    fromAxisAngle(out, ax, ay, az, angle) {
+        const half = angle * 0.5, s = Math.sin(half);
+        out[0] = ax*s; out[1] = ay*s; out[2] = az*s; out[3] = Math.cos(half);
+        return out;
+    },
+
+    multiply(out, a, b) {
+        const ax=a[0],ay=a[1],az=a[2],aw=a[3];
+        const bx=b[0],by=b[1],bz=b[2],bw=b[3];
+        out[0]=aw*bx+ax*bw+ay*bz-az*by;
+        out[1]=aw*by-ax*bz+ay*bw+az*bx;
+        out[2]=aw*bz+ax*by-ay*bx+az*bw;
+        out[3]=aw*bw-ax*bx-ay*by-az*bz;
+        return out;
+    },
+
+    normalize(out) {
+        const len = Math.sqrt(out[0]*out[0]+out[1]*out[1]+out[2]*out[2]+out[3]*out[3]) || 1;
+        out[0]/=len; out[1]/=len; out[2]/=len; out[3]/=len;
+        return out;
+    },
+
+    // Rotate vec3 by quaternion: v' = q * v * q^-1
+    rotateVec3(out, q, v) {
+        const qx=q[0],qy=q[1],qz=q[2],qw=q[3];
+        const vx=v[0],vy=v[1],vz=v[2];
+        const tx=2*(qy*vz-qz*vy), ty=2*(qz*vx-qx*vz), tz=2*(qx*vy-qy*vx);
+        out[0]=vx+qw*tx+(qy*tz-qz*ty);
+        out[1]=vy+qw*ty+(qz*tx-qx*tz);
+        out[2]=vz+qw*tz+(qx*ty-qy*tx);
+        return out;
+    },
+
+    slerp(out, a, b, t) {
+        let dot = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3];
+        let bx=b[0],by=b[1],bz=b[2],bw=b[3];
+        if (dot < 0) { bx=-bx; by=-by; bz=-bz; bw=-bw; dot=-dot; }
+        if (dot > 0.9999) {
+            out[0]=a[0]+t*(bx-a[0]); out[1]=a[1]+t*(by-a[1]);
+            out[2]=a[2]+t*(bz-a[2]); out[3]=a[3]+t*(bw-a[3]);
+        } else {
+            const theta=Math.acos(dot), sinT=Math.sin(theta);
+            const w1=Math.sin((1-t)*theta)/sinT, w2=Math.sin(t*theta)/sinT;
+            out[0]=w1*a[0]+w2*bx; out[1]=w1*a[1]+w2*by;
+            out[2]=w1*a[2]+w2*bz; out[3]=w1*a[3]+w2*bw;
+        }
+        return Quat.normalize(out);
+    },
+
+    // Rotation matrix (row-major 3x3) to quaternion
+    fromMatrix(out, m00,m01,m02, m10,m11,m12, m20,m21,m22) {
+        const tr = m00+m11+m22;
+        if (tr > 0) {
+            const s = 2*Math.sqrt(tr+1);
+            out[3]=0.25*s; out[0]=(m21-m12)/s; out[1]=(m02-m20)/s; out[2]=(m10-m01)/s;
+        } else if (m00>m11 && m00>m22) {
+            const s = 2*Math.sqrt(1+m00-m11-m22);
+            out[3]=(m21-m12)/s; out[0]=0.25*s; out[1]=(m01+m10)/s; out[2]=(m02+m20)/s;
+        } else if (m11>m22) {
+            const s = 2*Math.sqrt(1+m11-m00-m22);
+            out[3]=(m02-m20)/s; out[0]=(m01+m10)/s; out[1]=0.25*s; out[2]=(m12+m21)/s;
+        } else {
+            const s = 2*Math.sqrt(1+m22-m00-m11);
+            out[3]=(m10-m01)/s; out[0]=(m02+m20)/s; out[1]=(m12+m21)/s; out[2]=0.25*s;
+        }
+        return Quat.normalize(out);
+    },
+
+    // Build quaternion from offset direction (where +Z maps to) and up hint
+    fromLookDir(out, zx,zy,zz, ux,uy,uz) {
+        // right = up × z
+        let rx=uy*zz-uz*zy, ry=uz*zx-ux*zz, rz=ux*zy-uy*zx;
+        let rl=Math.sqrt(rx*rx+ry*ry+rz*rz);
+        if(rl<1e-6){rx=1;ry=0;rz=0;rl=1;}
+        rx/=rl; ry/=rl; rz/=rl;
+        // Recompute up = z × right (ensure orthogonal)
+        ux=zy*rz-zz*ry; uy=zz*rx-zx*rz; uz=zx*ry-zy*rx;
+        return Quat.fromMatrix(out, rx,ux,zx, ry,uy,zy, rz,uz,zz);
+    }
+};
+
+// =============================================================================
+// Orbit Camera
+// =============================================================================
+class OrbitCamera {
+    constructor(canvas) {
+        this.canvas = canvas;
+        this.target = [0, 0, 0];
+        this.distance = 5;
+        this.fov = Math.PI / 4;
+        this.near = 0.1;
+        this.far = 1000;
+        this.sceneRadius = 1;
+        this.dirty = true;
+        this._viewMatrix = Mat4.create();
+        this._projMatrix = Mat4.create();
+        this._eye = [0, 0, 0];
+        this._up = [0, 1, 0];
+        this.keys = new Set();
+
+        // Quaternion orientation: maps reference [0,0,1] to eye offset direction
+        this._quat = Quat.create();        // current (smoothed)
+        this._targetQuat = Quat.create();  // target (set by input)
+        // Initial view: camera elevated ~45 degrees (rotate around X by -PI/4)
+        Quat.fromAxisAngle(this._quat, 1, 0, 0, -Math.PI / 4);
+        Quat.copy(this._targetQuat, this._quat);
+
+        // Smoothing
+        this._targetDistance = 5;
+        this._targetCam = [0, 0, 0];
+
+        // Orbit inertia (angular velocity around camera axes)
+        this._vH = 0;  // horizontal (around camera up)
+        this._vV = 0;  // vertical (around camera right)
+        // Pan inertia
+        this._vPanX = 0; this._vPanY = 0; this._vPanZ = 0;
+        this._dragging = false;
+        this._lastMoveTime = 0;
+        this.moving = false;
+
+        // Temp vectors to avoid allocation
+        this._tmpQ = Quat.create();
+        this._tmpUp = [0, 0, 0];
+        this._tmpRight = [0, 0, 0];
+        this._refZ = [0, 0, 1];
+        this._refY = [0, 1, 0];
+        this._refX = [1, 0, 0];
+
+        this._setupEvents();
+    }
+
+    get eye() {
+        Quat.rotateVec3(this._eye, this._quat, this._refZ);
+        this._eye[0] = this.target[0] + this._eye[0] * this.distance;
+        this._eye[1] = this.target[1] + this._eye[1] * this.distance;
+        this._eye[2] = this.target[2] + this._eye[2] * this.distance;
+        return this._eye;
+    }
+
+    updateMatrices() {
+        this.near = Math.max(0.001, this.distance * 0.005);
+        this.far = Math.max(100, this.sceneRadius * 200);
+        const eye = this.eye;
+        Quat.rotateVec3(this._up, this._quat, this._refY);
+        Mat4.lookAtTo(this._viewMatrix, eye, this.target, this._up);
+        const aspect = this.canvas.width / this.canvas.height;
+        Mat4.perspectiveTo(this._projMatrix, this.fov, aspect, this.near, this.far);
+    }
+
+    get viewMatrix() { return this._viewMatrix; }
+    get projMatrix() { return this._projMatrix; }
+
+    get focalX() { return this.canvas.width / (2 * Math.tan(this.fov / 2) * (this.canvas.width / this.canvas.height)); }
+    get focalY() { return this.canvas.height / (2 * Math.tan(this.fov / 2)); }
+
+    fitScene(center, radius) {
+        this.target = [center[0], center[1], center[2]];
+        this._targetCam = [center[0], center[1], center[2]];
+        this.sceneRadius = radius;
+        this.distance = radius * 2.5;
+        this._targetDistance = this.distance;
+        Quat.fromAxisAngle(this._quat, 1, 0, 0, -Math.PI / 4);
+        Quat.copy(this._targetQuat, this._quat);
+        this._vH = 0; this._vV = 0;
+        this._vPanX = 0; this._vPanY = 0; this._vPanZ = 0;
+        this.dirty = true;
+    }
+
+    // Set camera from COLMAP extrinsics
+    setFromExtrinsics(cam) {
+        const dist = this.distance;
+        // Target = camera position + forward * distance
+        this._targetCam[0] = this.target[0] = cam.cx + cam.fwdX * dist;
+        this._targetCam[1] = this.target[1] = cam.cy + cam.fwdY * dist;
+        this._targetCam[2] = this.target[2] = cam.cz + cam.fwdZ * dist;
+        this._targetDistance = this.distance;
+
+        // Offset direction = from target to eye = -forward (normalized)
+        const fl = Math.sqrt(cam.fwdX*cam.fwdX + cam.fwdY*cam.fwdY + cam.fwdZ*cam.fwdZ) || 1;
+        const zx = -cam.fwdX/fl, zy = -cam.fwdY/fl, zz = -cam.fwdZ/fl;
+        Quat.fromLookDir(this._quat, zx, zy, zz, cam.upX, cam.upY, cam.upZ);
+        Quat.copy(this._targetQuat, this._quat);
+
+        this._vH = 0; this._vV = 0;
+        this._vPanX = 0; this._vPanY = 0; this._vPanZ = 0;
+        this.dirty = true;
+    }
+
+    smoothUpdate(dt) {
+        const SMOOTH = 20;
+        const SMOOTH_ZOOM = 14;
+        const FRICTION = 6;
+        const MIN_V = 0.0005;
+
+        // Apply orbit inertia when not dragging
+        if (!this._dragging) {
+            if (Math.abs(this._vH) > MIN_V || Math.abs(this._vV) > MIN_V) {
+                // Use view matrix screen axes for inertia (same as drag)
+                const vm = this._viewMatrix;
+                const scrUx = vm[1], scrUy = vm[5], scrUz = vm[9];
+                const scrRx = vm[0], scrRy = vm[4], scrRz = vm[8];
+                if (Math.abs(this._vH) > MIN_V) {
+                    Quat.fromAxisAngle(this._tmpQ, scrUx, scrUy, scrUz, this._vH * dt);
+                    Quat.multiply(this._targetQuat, this._tmpQ, this._targetQuat);
+                }
+                if (Math.abs(this._vV) > MIN_V) {
+                    Quat.fromAxisAngle(this._tmpQ, scrRx, scrRy, scrRz, this._vV * dt);
+                    Quat.multiply(this._targetQuat, this._tmpQ, this._targetQuat);
+                }
+                Quat.normalize(this._targetQuat);
+                const decay = Math.exp(-FRICTION * dt);
+                this._vH *= decay; this._vV *= decay;
+                if (Math.abs(this._vH) < MIN_V) this._vH = 0;
+                if (Math.abs(this._vV) < MIN_V) this._vV = 0;
+            }
+
+            if (Math.abs(this._vPanX) > 0.00001 || Math.abs(this._vPanY) > 0.00001 || Math.abs(this._vPanZ) > 0.00001) {
+                const decay = Math.exp(-FRICTION * dt);
+                this._targetCam[0] += this._vPanX * dt;
+                this._targetCam[1] += this._vPanY * dt;
+                this._targetCam[2] += this._vPanZ * dt;
+                this._vPanX *= decay; this._vPanY *= decay; this._vPanZ *= decay;
+            } else { this._vPanX = 0; this._vPanY = 0; this._vPanZ = 0; }
+        }
+
+        const t = 1 - Math.exp(-SMOOTH * dt);
+        const tz = 1 - Math.exp(-SMOOTH_ZOOM * dt);
+        let changed = false;
+        const eps = 1e-6;
+
+        // Slerp quaternion
+        const qdot = Math.abs(Quat.dot(this._quat, this._targetQuat));
+        if (qdot < 0.999999) {
+            Quat.slerp(this._quat, this._quat, this._targetQuat, t);
+            changed = true;
+        } else {
+            Quat.copy(this._quat, this._targetQuat);
+        }
+
+        // Lerp distance in log-space
+        const logDist = Math.log(this.distance);
+        const logTarget = Math.log(this._targetDistance);
+        const ld = logTarget - logDist;
+        if (Math.abs(ld) > eps) {
+            this.distance = Math.exp(logDist + ld * tz);
+            changed = true;
+        } else this.distance = this._targetDistance;
+
+        // Lerp target position
+        for (let i = 0; i < 3; i++) {
+            const d = this._targetCam[i] - this.target[i];
+            if (Math.abs(d) > eps * Math.max(1, this.sceneRadius)) {
+                this.target[i] += d * t;
+                changed = true;
+            } else this.target[i] = this._targetCam[i];
+        }
+
+        this.moving = changed;
+        if (changed) this.dirty = true;
+    }
+
+    _setupEvents() {
+        let lastX = 0, lastY = 0, button = 0;
+
+        this.canvas.addEventListener('mousedown', e => {
+            this._dragging = true;
+            lastX = e.clientX; lastY = e.clientY; button = e.button;
+            this._lastMoveTime = performance.now();
+            this._vH = 0; this._vV = 0;
+            this._vPanX = 0; this._vPanY = 0; this._vPanZ = 0;
+            e.preventDefault();
+        });
+        window.addEventListener('mousemove', e => {
+            if (!this._dragging) return;
+            const dx = e.clientX - lastX, dy = e.clientY - lastY;
+            lastX = e.clientX; lastY = e.clientY;
+            const now = performance.now();
+            const mdt = Math.max((now - this._lastMoveTime) / 1000, 0.004);
+            this._lastMoveTime = now;
+
+            if (button === 0 && !e.shiftKey) {
+                // Screen-relative orbit: use view matrix axes (always match screen)
+                const speed = 0.005;
+                const hAngle = -dx * speed;
+                const vAngle = -dy * speed;
+
+                // Extract screen up & right from current view matrix
+                const vm = this._viewMatrix;
+                const scrRx = vm[0], scrRy = vm[4], scrRz = vm[8];   // screen right in world
+                const scrUx = vm[1], scrUy = vm[5], scrUz = vm[9];   // screen up in world
+
+                if (Math.abs(hAngle) > 1e-8) {
+                    Quat.fromAxisAngle(this._tmpQ, scrUx, scrUy, scrUz, hAngle);
+                    Quat.multiply(this._targetQuat, this._tmpQ, this._targetQuat);
+                }
+                if (Math.abs(vAngle) > 1e-8) {
+                    Quat.fromAxisAngle(this._tmpQ, scrRx, scrRy, scrRz, vAngle);
+                    Quat.multiply(this._targetQuat, this._tmpQ, this._targetQuat);
+                }
+                Quat.normalize(this._targetQuat);
+
+                this._vH = this._vH * 0.6 + (hAngle / mdt) * 0.4;
+                this._vV = this._vV * 0.6 + (vAngle / mdt) * 0.4;
+            } else {
+                // Pan
+                const vm = this._viewMatrix;
+                const rx = vm[0], ry = vm[4], rz = vm[8];
+                const ux = vm[1], uy = vm[5], uz = vm[9];
+                const panSpeed = this._targetDistance * 0.0015;
+                const px = -(rx*dx - ux*dy) * panSpeed;
+                const py = -(ry*dx - uy*dy) * panSpeed;
+                const pz = -(rz*dx - uz*dy) * panSpeed;
+                this._targetCam[0] += px; this._targetCam[1] += py; this._targetCam[2] += pz;
+                this._vPanX = this._vPanX*0.6 + (px/mdt)*0.4;
+                this._vPanY = this._vPanY*0.6 + (py/mdt)*0.4;
+                this._vPanZ = this._vPanZ*0.6 + (pz/mdt)*0.4;
+            }
+            this.dirty = true;
+        });
+        window.addEventListener('mouseup', () => { this._dragging = false; });
+
+        this.canvas.addEventListener('wheel', e => {
+            const factor = Math.pow(1.03, e.deltaY * 0.01);
+            this._targetDistance = Math.max(this.sceneRadius * 0.001, this._targetDistance * factor);
+            this.dirty = true;
+            e.preventDefault();
+        }, { passive: false });
+
+        this.canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+        window.addEventListener('keydown', e => {
+            const k = e.key.toLowerCase();
+            if (k.length === 1 && 'wasdqe'.includes(k)) {
+                this.keys.add(k);
+                e.preventDefault();
+            }
+        });
+        window.addEventListener('keyup', e => {
+            this.keys.delete(e.key.toLowerCase());
+        });
+    }
+
+    processKeys(dt) {
+        if (this.keys.size === 0) return;
+        const panSpeed = this._targetDistance * 0.8 * dt;
+        const rotSpeed = 1.0 * dt;
+        const vm = this._viewMatrix;
+        const rx = vm[0], ry = vm[4], rz = vm[8]; // camera right
+        const ux = vm[1], uy = vm[5], uz = vm[9]; // camera up
+        if (this.keys.has('a')) { this._targetCam[0] -= rx*panSpeed; this._targetCam[1] -= ry*panSpeed; this._targetCam[2] -= rz*panSpeed; }
+        if (this.keys.has('d')) { this._targetCam[0] += rx*panSpeed; this._targetCam[1] += ry*panSpeed; this._targetCam[2] += rz*panSpeed; }
+        if (this.keys.has('w')) { this._targetCam[0] += ux*panSpeed; this._targetCam[1] += uy*panSpeed; this._targetCam[2] += uz*panSpeed; }
+        if (this.keys.has('s')) { this._targetCam[0] -= ux*panSpeed; this._targetCam[1] -= uy*panSpeed; this._targetCam[2] -= uz*panSpeed; }
+        // Q/E: roll around camera forward axis
+        if (this.keys.has('q') || this.keys.has('e')) {
+            Quat.rotateVec3(this._tmpUp, this._targetQuat, this._refZ); // forward = offset dir
+            const angle = (this.keys.has('q') ? -1 : 1) * rotSpeed;
+            Quat.fromAxisAngle(this._tmpQ, this._tmpUp[0], this._tmpUp[1], this._tmpUp[2], angle);
+            Quat.multiply(this._targetQuat, this._tmpQ, this._targetQuat);
+            Quat.normalize(this._targetQuat);
+        }
+        this.dirty = true;
+    }
+}
+
+// =============================================================================
+// PLY Parser
+// =============================================================================
+function parsePly(buffer) {
+    const headerEnd = findHeaderEnd(buffer);
+    const headerStr = new TextDecoder().decode(new Uint8Array(buffer, 0, headerEnd));
+    const lines = headerStr.split('\n').map(s => s.trim());
+
+    let vertexCount = 0;
+    const properties = [];
+    let inVertex = false;
+
+    for (const line of lines) {
+        if (line.startsWith('element vertex')) {
+            vertexCount = parseInt(line.split(/\s+/)[2]);
+            inVertex = true;
+        } else if (line.startsWith('element') && inVertex) {
+            inVertex = false;
+        } else if (line.startsWith('property') && inVertex) {
+            const parts = line.split(/\s+/);
+            const type = parts[1];
+            const name = parts[2];
+            properties.push({ name, type, size: typeSize(type) });
+        }
+    }
+
+    const stride = properties.reduce((s, p) => s + p.size, 0);
+    const dataOffset = headerEnd;
+    const dataView = new DataView(buffer, dataOffset);
+
+    // Build property offset map
+    const propMap = {};
+    let off = 0;
+    for (const p of properties) {
+        propMap[p.name] = { offset: off, type: p.type };
+        off += p.size;
+    }
+
+    const readFloat = (i, name) => {
+        const p = propMap[name];
+        if (!p) return 0;
+        return dataView.getFloat32(i * stride + p.offset, true);
+    };
+
+    // Extract data
+    const positions = new Float32Array(vertexCount * 3);
+    const scales = new Float32Array(vertexCount * 3);
+    const rotations = new Float32Array(vertexCount * 4);
+    const colors = new Float32Array(vertexCount * 3);
+    const opacities = new Float32Array(vertexCount);
+
+    const SH_C0 = 0.28209479177387814;
+
+    for (let i = 0; i < vertexCount; i++) {
+        positions[i*3]   = readFloat(i, 'x');
+        positions[i*3+1] = readFloat(i, 'y');
+        positions[i*3+2] = readFloat(i, 'z');
+
+        // Color from SH DC band (f_dc_0/1/2) or fallback to red/green/blue
+        if (propMap['f_dc_0']) {
+            colors[i*3]   = Math.max(0, Math.min(1, 0.5 + SH_C0 * readFloat(i, 'f_dc_0')));
+            colors[i*3+1] = Math.max(0, Math.min(1, 0.5 + SH_C0 * readFloat(i, 'f_dc_1')));
+            colors[i*3+2] = Math.max(0, Math.min(1, 0.5 + SH_C0 * readFloat(i, 'f_dc_2')));
+        } else if (propMap['red']) {
+            colors[i*3]   = readFloat(i, 'red') / 255;
+            colors[i*3+1] = readFloat(i, 'green') / 255;
+            colors[i*3+2] = readFloat(i, 'blue') / 255;
+        } else {
+            colors[i*3] = colors[i*3+1] = colors[i*3+2] = 0.5;
+        }
+
+        // Opacity (sigmoid)
+        const rawOp = readFloat(i, 'opacity');
+        opacities[i] = 1.0 / (1.0 + Math.exp(-rawOp));
+
+        // Scale (exp)
+        scales[i*3]   = Math.exp(readFloat(i, 'scale_0'));
+        scales[i*3+1] = Math.exp(readFloat(i, 'scale_1'));
+        scales[i*3+2] = Math.exp(readFloat(i, 'scale_2'));
+
+        // Rotation quaternion (w, x, y, z) - normalize
+        const rw = readFloat(i, 'rot_0'), rx = readFloat(i, 'rot_1');
+        const ry = readFloat(i, 'rot_2'), rz = readFloat(i, 'rot_3');
+        const rlen = Math.sqrt(rw*rw + rx*rx + ry*ry + rz*rz) || 1;
+        rotations[i*4]   = rw / rlen;
+        rotations[i*4+1] = rx / rlen;
+        rotations[i*4+2] = ry / rlen;
+        rotations[i*4+3] = rz / rlen;
+    }
+
+    return { vertexCount, positions, scales, rotations, colors, opacities };
+}
+
+function findHeaderEnd(buffer) {
+    const bytes = new Uint8Array(buffer);
+    // Search for "end_header" followed by \n or \r\n
+    const tag = [101, 110, 100, 95, 104, 101, 97, 100, 101, 114]; // "end_header"
+    for (let i = 0; i < Math.min(bytes.length, 10000); i++) {
+        let match = true;
+        for (let j = 0; j < tag.length; j++) {
+            if (bytes[i+j] !== tag[j]) { match = false; break; }
+        }
+        if (match) {
+            let end = i + tag.length;
+            if (bytes[end] === 13) end++; // skip \r
+            if (bytes[end] === 10) end++; // skip \n
+            return end;
+        }
+    }
+    throw new Error('PLY header not found');
+}
+
+function typeSize(type) {
+    switch (type) {
+        case 'float': case 'float32': case 'int': case 'uint': return 4;
+        case 'double': case 'float64': return 8;
+        case 'short': case 'ushort': case 'int16': case 'uint16': return 2;
+        case 'char': case 'uchar': case 'int8': case 'uint8': return 1;
+        default: return 4;
+    }
+}
+
+// =============================================================================
+// .splat Parser (antimatter15 format: 32 bytes/splat)
+// =============================================================================
+function parseSplat(buffer) {
+    const vertexCount = buffer.byteLength / 32;
+    const f32 = new Float32Array(buffer);
+    const u8 = new Uint8Array(buffer);
+
+    const positions = new Float32Array(vertexCount * 3);
+    const scales = new Float32Array(vertexCount * 3);
+    const rotations = new Float32Array(vertexCount * 4);
+    const colors = new Float32Array(vertexCount * 3);
+    const opacities = new Float32Array(vertexCount);
+
+    for (let i = 0; i < vertexCount; i++) {
+        const fOff = i * 8;  // 32 bytes / 4 = 8 floats
+        const bOff = i * 32;
+
+        positions[i*3]   = f32[fOff];
+        positions[i*3+1] = f32[fOff+1];
+        positions[i*3+2] = f32[fOff+2];
+
+        scales[i*3]   = f32[fOff+3];
+        scales[i*3+1] = f32[fOff+4];
+        scales[i*3+2] = f32[fOff+5];
+
+        colors[i*3]   = u8[bOff+24] / 255;
+        colors[i*3+1] = u8[bOff+25] / 255;
+        colors[i*3+2] = u8[bOff+26] / 255;
+        opacities[i]  = u8[bOff+27] / 255;
+
+        // Rotation: uint8 [0-255] -> [-1, 1]
+        const qw = (u8[bOff+28] - 128) / 128;
+        const qx = (u8[bOff+29] - 128) / 128;
+        const qy = (u8[bOff+30] - 128) / 128;
+        const qz = (u8[bOff+31] - 128) / 128;
+        const qlen = Math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz) || 1;
+        rotations[i*4]   = qw / qlen;
+        rotations[i*4+1] = qx / qlen;
+        rotations[i*4+2] = qy / qlen;
+        rotations[i*4+3] = qz / qlen;
+    }
+
+    return { vertexCount, positions, scales, rotations, colors, opacities };
+}
+
+// =============================================================================
+// images.txt Parser (COLMAP format)
+// =============================================================================
+function parseImagesTxt(text) {
+    const cameras = [];
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line || line.startsWith('#')) continue;
+        const parts = line.split(/\s+/);
+        if (parts.length < 10) continue;
+        // IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
+        const qw = parseFloat(parts[1]), qx = parseFloat(parts[2]);
+        const qy = parseFloat(parts[3]), qz = parseFloat(parts[4]);
+        const tx = parseFloat(parts[5]), ty = parseFloat(parts[6]), tz = parseFloat(parts[7]);
+        const name = parts[9] || '';
+        if (isNaN(qw)) continue;
+        // COLMAP stores world-to-camera: R*pw + t = pc
+        // Camera position in world: C = -R^T * t
+        // Build rotation matrix from quaternion
+        const r00 = 1-2*(qy*qy+qz*qz), r01 = 2*(qx*qy-qw*qz), r02 = 2*(qx*qz+qw*qy);
+        const r10 = 2*(qx*qy+qw*qz), r11 = 1-2*(qx*qx+qz*qz), r12 = 2*(qy*qz-qw*qx);
+        const r20 = 2*(qx*qz-qw*qy), r21 = 2*(qy*qz+qw*qx), r22 = 1-2*(qx*qx+qy*qy);
+        // Camera position = -R^T * t
+        const cx = -(r00*tx + r10*ty + r20*tz);
+        const cy = -(r01*tx + r11*ty + r21*tz);
+        const cz = -(r02*tx + r12*ty + r22*tz);
+        // Forward direction (+Z axis of camera in world): R^T * [0,0,1]
+        const fwdX = r20, fwdY = r21, fwdZ = r22;
+        // Up direction (negative Y axis of camera in world for COLMAP convention): -R^T * [0,1,0]
+        const upX = -r10, upY = -r11, upZ = -r12;
+        cameras.push({ cx, cy, cz, fwdX, fwdY, fwdZ, upX, upY, upZ, name });
+        // Skip the POINTS2D line (next line)
+        i++;
+    }
+    return cameras;
+}
+
+// =============================================================================
+// Precompute 3D Covariance from Scale + Rotation
+// =============================================================================
+function computeCov3D(count, scales, rotations) {
+    // Returns 6 floats per Gaussian: upper-triangular symmetric 3x3
+    // covA = (cov00, cov01, cov02), covB = (cov11, cov12, cov22)
+    const covA = new Float32Array(count * 3);
+    const covB = new Float32Array(count * 3);
+
+    for (let i = 0; i < count; i++) {
+        const sx = scales[i*3], sy = scales[i*3+1], sz = scales[i*3+2];
+        const qw = rotations[i*4], qx = rotations[i*4+1], qy = rotations[i*4+2], qz = rotations[i*4+3];
+
+        // Rotation matrix from quaternion (column-major thinking, row-major storage)
+        const r00 = 1 - 2*(qy*qy + qz*qz), r01 = 2*(qx*qy - qw*qz), r02 = 2*(qx*qz + qw*qy);
+        const r10 = 2*(qx*qy + qw*qz), r11 = 1 - 2*(qx*qx + qz*qz), r12 = 2*(qy*qz - qw*qx);
+        const r20 = 2*(qx*qz - qw*qy), r21 = 2*(qy*qz + qw*qx), r22 = 1 - 2*(qx*qx + qy*qy);
+
+        // M = R * S (each column of R scaled by corresponding scale)
+        const m00 = r00*sx, m01 = r01*sy, m02 = r02*sz;
+        const m10 = r10*sx, m11 = r11*sy, m12 = r12*sz;
+        const m20 = r20*sx, m21 = r21*sy, m22 = r22*sz;
+
+        // Sigma = M * M^T
+        covA[i*3]   = m00*m00 + m01*m01 + m02*m02; // cov00
+        covA[i*3+1] = m00*m10 + m01*m11 + m02*m12; // cov01
+        covA[i*3+2] = m00*m20 + m01*m21 + m02*m22; // cov02
+        covB[i*3]   = m10*m10 + m11*m11 + m12*m12; // cov11
+        covB[i*3+1] = m10*m20 + m11*m21 + m12*m22; // cov12
+        covB[i*3+2] = m20*m20 + m21*m21 + m22*m22; // cov22
+    }
+
+    return { covA, covB };
+}
+
+// =============================================================================
+// Shaders
+// =============================================================================
+const VS_SRC = `#version 300 es
+precision highp float;
+precision highp int;
+
+layout(location = 0) in vec2 a_quad;
+layout(location = 1) in uint a_idx;
+
+uniform highp sampler2D u_posOp;    // (x, y, z, opacity)
+uniform highp sampler2D u_covA;     // (cov00, cov01, cov02, 0)
+uniform highp sampler2D u_covB;     // (cov11, cov12, cov22, 0)
+uniform highp sampler2D u_color;    // (r, g, b, 0)
+
+uniform mat4 u_view;
+uniform mat4 u_proj;
+uniform vec2 u_focal;
+uniform vec2 u_viewport;
+uniform int u_texW;
+uniform float u_near;
+uniform int u_mode;         // 0: normal, 1: ring, 2: points
+uniform float u_pointSize;  // point radius in pixels
+
+out vec3 v_conic;
+out float v_opacity;
+out vec2 v_offset;
+out vec3 v_color;
+
+void main() {
+    int idx = int(a_idx);
+    ivec2 tc = ivec2(idx % u_texW, idx / u_texW);
+
+    vec4 posOp = texelFetch(u_posOp, tc, 0);
+    vec3 center = posOp.xyz;
+    float opacity = posOp.w;
+
+    // Transform to view space
+    vec4 viewPos = u_view * vec4(center, 1.0);
+    if (viewPos.z > -u_near) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    vec4 projPos = u_proj * viewPos;
+    vec2 ndcCenter = projPos.xy / projPos.w;
+    vec2 pixelCenter = (ndcCenter * 0.5 + 0.5) * u_viewport;
+
+    // Read 3D covariance
+    vec4 ca = texelFetch(u_covA, tc, 0);
+    vec4 cb = texelFetch(u_covB, tc, 0);
+
+    // Build 3D covariance (symmetric)
+    mat3 Vrk = mat3(
+        ca.x, ca.y, ca.z,
+        ca.y, cb.x, cb.y,
+        ca.z, cb.y, cb.z
+    );
+
+    // Transform to view space
+    mat3 W = mat3(u_view);
+    mat3 covView = W * Vrk * transpose(W);
+
+    // Jacobian of perspective projection
+    float fx = u_focal.x, fy = u_focal.y;
+    float tz = viewPos.z;
+    float tz2 = tz * tz;
+
+    vec3 j0 = vec3(fx / tz, 0.0, -(fx * viewPos.x) / tz2);
+    vec3 j1 = vec3(0.0, fy / tz, -(fy * viewPos.y) / tz2);
+
+    // 2D covariance = J * covView * J^T
+    float c00 = dot(j0, covView * j0);
+    float c01 = dot(j0, covView * j1);
+    float c11 = dot(j1, covView * j1);
+
+    // Low-pass filter (anti-aliasing)
+    c00 += 0.3;
+    c11 += 0.3;
+
+    // Eigenvalues for bounding radius
+    float det = c00 * c11 - c01 * c01;
+    if (det <= 0.0) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    float mid = 0.5 * (c00 + c11);
+    float disc = sqrt(max(0.0, mid * mid - det));
+    float lambda1 = mid + disc;
+    float lambda2 = max(mid - disc, 0.1);
+
+    float radius = ceil(3.0 * sqrt(lambda1));
+
+    if (radius < 1.0) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    // Clamp max radius for performance
+    radius = min(radius, min(u_viewport.x, u_viewport.y));
+
+    // Points mode: override radius to fixed point size
+    if (u_mode == 2) {
+        radius = u_pointSize;
+    }
+
+    // Frustum cull
+    vec2 halfClip = projPos.ww / u_viewport;
+    if (abs(ndcCenter.x) - radius / u_viewport.x * 2.0 > 1.0 ||
+        abs(ndcCenter.y) - radius / u_viewport.y * 2.0 > 1.0) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    // Inverse 2D covariance (conic)
+    float invDet = 1.0 / det;
+    v_conic = vec3(c11 * invDet, -c01 * invDet, c00 * invDet);
+    v_opacity = opacity;
+
+    // Position quad corner
+    vec2 offset = a_quad * radius;
+    v_offset = offset;
+
+    vec2 pixelPos = pixelCenter + offset;
+    vec2 ndcPos = (pixelPos / u_viewport) * 2.0 - 1.0;
+    gl_Position = vec4(ndcPos * projPos.w, projPos.z, projPos.w);
+
+    // Color
+    v_color = texelFetch(u_color, tc, 0).rgb;
+}`;
+
+const FS_SRC = `#version 300 es
+precision highp float;
+precision highp int;
+
+in vec3 v_conic;
+in float v_opacity;
+in vec2 v_offset;
+in vec3 v_color;
+
+uniform int u_mode;        // 0: filled, 1: ring, 2: points
+uniform float u_ringSize;  // ring thickness (0.0 - 1.0)
+uniform float u_pointSize; // point radius in pixels
+
+out vec4 fragColor;
+
+void main() {
+    // Points mode: render as solid colored circle
+    if (u_mode == 2) {
+        float dist = length(v_offset);
+        if (dist > u_pointSize) discard;
+        // Soft edge anti-aliasing
+        float edge = 1.0 - smoothstep(u_pointSize - 1.0, u_pointSize, dist);
+        fragColor = vec4(v_color * edge, edge);
+        return;
+    }
+
+    float power = -0.5 * (
+        v_conic.x * v_offset.x * v_offset.x +
+        2.0 * v_conic.y * v_offset.x * v_offset.y +
+        v_conic.z * v_offset.y * v_offset.y
+    );
+
+    if (power > 0.0) discard;
+
+    float alpha = min(0.99, v_opacity * exp(power));
+    if (alpha < 1.0 / 255.0) discard;
+
+    // Ring mode: hollow out the interior, keep only the outer ring
+    if (u_mode == 1 && u_ringSize > 0.0) {
+        float A = -power / 4.0; // normalized distance: 0 at center, ~1 at edge
+        if (A < 1.0 - u_ringSize) {
+            alpha = max(0.05, alpha); // inner: nearly transparent
+        } else {
+            alpha = 0.6;             // ring: visible
+        }
+    }
+
+    // Premultiplied alpha
+    fragColor = vec4(v_color * alpha, alpha);
+}`;
+
+// =============================================================================
+// WebGL Renderer
+// =============================================================================
+class GaussianRenderer {
+    constructor(canvas) {
+        this.canvas = canvas;
+        const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: true });
+        if (!gl) throw new Error('WebGL2 not supported');
+        this.gl = gl;
+        this.program = null;
+        this.splatCount = 0;
+        this.texWidth = 0;
+        this.texHeight = 0;
+        this.vao = null;
+        this.indexVBO = null;
+        this.textures = {};
+        this.ringMode = false;
+        this.ringSize = 0.3;
+        this.pointsMode = false;
+        this.pointSize = 3.0;
+    }
+
+    init() {
+        const gl = this.gl;
+
+        // Compile shaders
+        const vs = this._compileShader(gl.VERTEX_SHADER, VS_SRC);
+        const fs = this._compileShader(gl.FRAGMENT_SHADER, FS_SRC);
+        this.program = gl.createProgram();
+        gl.attachShader(this.program, vs);
+        gl.attachShader(this.program, fs);
+        gl.linkProgram(this.program);
+        if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
+            throw new Error('Shader link error: ' + gl.getProgramInfoLog(this.program));
+        }
+
+        // Get uniform locations
+        this.uniforms = {};
+        const uNames = ['u_posOp','u_covA','u_covB','u_color','u_view','u_proj','u_focal','u_viewport','u_texW','u_near','u_mode','u_ringSize','u_pointSize'];
+        for (const n of uNames) this.uniforms[n] = gl.getUniformLocation(this.program, n);
+
+        // Create VAO
+        this.vao = gl.createVertexArray();
+        gl.bindVertexArray(this.vao);
+
+        // Quad VBO (4 vertices)
+        const quadData = new Float32Array([-1,-1, 1,-1, 1,1, -1,1]);
+        const quadVBO = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, quadData, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+        // Quad EBO
+        const ebo = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2, 0,2,3]), gl.STATIC_DRAW);
+
+        // Instance index VBO (sorted splat indices)
+        this.indexVBO = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.indexVBO);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_INT, 0, 0);
+        gl.vertexAttribDivisor(1, 1);
+
+        gl.bindVertexArray(null);
+    }
+
+    // Pre-bake a frame's data into GPU textures and return a frame object
+    bakeFrame(data) {
+        const { vertexCount, positions, colors, opacities } = data;
+        const { covA, covB } = computeCov3D(vertexCount, data.scales, data.rotations);
+
+        const texWidth = Math.ceil(Math.sqrt(vertexCount));
+        const texHeight = Math.ceil(vertexCount / texWidth);
+        const texSize = texWidth * texHeight;
+
+        const posOpData = new Float32Array(texSize * 4);
+        const covAData  = new Float32Array(texSize * 4);
+        const covBData  = new Float32Array(texSize * 4);
+        const colorData = new Float32Array(texSize * 4);
+
+        for (let i = 0; i < vertexCount; i++) {
+            posOpData[i*4]   = positions[i*3];
+            posOpData[i*4+1] = positions[i*3+1];
+            posOpData[i*4+2] = positions[i*3+2];
+            posOpData[i*4+3] = opacities[i];
+
+            covAData[i*4]   = covA[i*3];
+            covAData[i*4+1] = covA[i*3+1];
+            covAData[i*4+2] = covA[i*3+2];
+
+            covBData[i*4]   = covB[i*3];
+            covBData[i*4+1] = covB[i*3+1];
+            covBData[i*4+2] = covB[i*3+2];
+
+            colorData[i*4]   = colors[i*3];
+            colorData[i*4+1] = colors[i*3+1];
+            colorData[i*4+2] = colors[i*3+2];
+            colorData[i*4+3] = 1;
+        }
+
+        return {
+            vertexCount,
+            positions,
+            texWidth,
+            texHeight,
+            texPosOp: this._createF32Tex(posOpData, texWidth, texHeight),
+            texCovA:  this._createF32Tex(covAData, texWidth, texHeight),
+            texCovB:  this._createF32Tex(covBData, texWidth, texHeight),
+            texColor: this._createF32Tex(colorData, texWidth, texHeight),
+        };
+    }
+
+    // Activate a pre-baked frame (swap textures + upload best available sort)
+    activateFrame(frame, sortIndices) {
+        this.splatCount = frame.vertexCount;
+        this.texWidth = frame.texWidth;
+        this.texHeight = frame.texHeight;
+        this.textures.posOp = frame.texPosOp;
+        this.textures.covA  = frame.texCovA;
+        this.textures.covB  = frame.texCovB;
+        this.textures.color = frame.texColor;
+        this.positions = frame.positions;
+        this._texDirty = true;
+        this.uploadSortIndices(sortIndices);
+    }
+
+    uploadData(data) {
+        const frame = this.bakeFrame(data);
+        // Build identity indices as fallback
+        const indices = new Uint32Array(frame.vertexCount);
+        for (let i = 0; i < frame.vertexCount; i++) indices[i] = i;
+        this.activateFrame(frame, indices);
+    }
+
+    uploadSortIndices(indices) {
+        const gl = this.gl;
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.indexVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
+    }
+
+    render(camera) {
+        const gl = this.gl;
+        const canvas = this.canvas;
+
+        // Resize with DPI awareness
+        const dpr = window.devicePixelRatio || 1;
+        const displayW = Math.round(canvas.clientWidth * dpr);
+        const displayH = Math.round(canvas.clientHeight * dpr);
+        if (canvas.width !== displayW || canvas.height !== displayH) {
+            canvas.width = displayW;
+            canvas.height = displayH;
+        }
+
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(0.067, 0.067, 0.067, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        if (this.splatCount === 0) return;
+
+        // Set render state once (only change when needed)
+        if (!this._stateSet) {
+            gl.disable(gl.DEPTH_TEST);
+            gl.enable(gl.BLEND);
+            gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+            this._stateSet = true;
+        }
+
+        gl.useProgram(this.program);
+
+        // Bind textures (only rebind if data changed)
+        if (this._texDirty !== false) {
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, this.textures.posOp);
+            gl.uniform1i(this.uniforms.u_posOp, 0);
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, this.textures.covA);
+            gl.uniform1i(this.uniforms.u_covA, 1);
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, this.textures.covB);
+            gl.uniform1i(this.uniforms.u_covB, 2);
+            gl.activeTexture(gl.TEXTURE3);
+            gl.bindTexture(gl.TEXTURE_2D, this.textures.color);
+            gl.uniform1i(this.uniforms.u_color, 3);
+            gl.uniform1i(this.uniforms.u_texW, this.texWidth);
+            this._texDirty = false;
+        }
+
+        // Per-frame uniforms
+        gl.uniformMatrix4fv(this.uniforms.u_view, false, camera.viewMatrix);
+        gl.uniformMatrix4fv(this.uniforms.u_proj, false, camera.projMatrix);
+        gl.uniform2f(this.uniforms.u_focal, camera.focalX, camera.focalY);
+        gl.uniform2f(this.uniforms.u_viewport, canvas.width, canvas.height);
+        gl.uniform1f(this.uniforms.u_near, camera.near);
+        const mode = this.pointsMode ? 2 : (this.ringMode ? 1 : 0);
+        gl.uniform1i(this.uniforms.u_mode, mode);
+        gl.uniform1f(this.uniforms.u_ringSize, this.ringSize);
+        gl.uniform1f(this.uniforms.u_pointSize, this.pointSize);
+
+        // Draw
+        gl.bindVertexArray(this.vao);
+        gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, this.splatCount);
+        gl.bindVertexArray(null);
+    }
+
+    _createF32Tex(data, w, h) {
+        const gl = this.gl;
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, data);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        return tex;
+    }
+
+    _compileShader(type, source) {
+        const gl = this.gl;
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            const log = gl.getShaderInfoLog(shader);
+            gl.deleteShader(shader);
+            throw new Error('Shader compile error: ' + log);
+        }
+        return shader;
+    }
+}
+
+// =============================================================================
+// Main Application
+// =============================================================================
+const canvas = document.getElementById('canvas');
+const infoEl = document.getElementById('info');
+const loadingEl = document.getElementById('loading');
+const loadBtn = document.getElementById('loadBtn');
+const fileInput = document.getElementById('fileInput');
+const dropOverlay = document.getElementById('drop-overlay');
+
+const renderer = new GaussianRenderer(canvas);
+try {
+    renderer.init();
+} catch (err) {
+    console.error('Renderer init failed:', err);
+    loadingEl.style.display = 'block';
+    loadingEl.textContent = 'WebGL Error: ' + err.message;
+}
+
+const camera = new OrbitCamera(canvas);
+
+// Sort worker
+const workerBlob = new Blob([SORT_WORKER_SRC], { type: 'application/javascript' });
+// =============================================================================
+// Canonical Direction Sort Cache (architectural flicker-free solution)
+// =============================================================================
+// Pre-sort every frame for 26 evenly-spaced view directions on the unit sphere.
+// At render time, find closest cached direction → instant O(1) lookup, zero latency.
+// 26 directions = 6 face-centers + 8 cube-corners + 12 edge-midpoints of a cube.
+// Max angular error to nearest direction: ~22°, imperceptible during motion.
+// Memory: 26 dirs × N frames × vertexCount × 4 bytes (e.g. 26×30×100K×4 ≈ 312MB)
+
+const CANONICAL_DIRS = [];
+// 6 axis-aligned directions
+CANONICAL_DIRS.push([1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]);
+// 8 cube corner directions (normalized)
+const _cv = 1 / Math.sqrt(3);
+for (const sx of [-1,1]) for (const sy of [-1,1]) for (const sz of [-1,1])
+    CANONICAL_DIRS.push([sx*_cv, sy*_cv, sz*_cv]);
+// 12 edge midpoint directions (normalized)
+const _ev = 1 / Math.sqrt(2);
+CANONICAL_DIRS.push(
+    [_ev,_ev,0],[_ev,-_ev,0],[-_ev,_ev,0],[-_ev,-_ev,0],
+    [_ev,0,_ev],[_ev,0,-_ev],[-_ev,0,_ev],[-_ev,0,-_ev],
+    [0,_ev,_ev],[0,_ev,-_ev],[0,-_ev,_ev],[0,-_ev,-_ev]
+);
+const NUM_DIRS = CANONICAL_DIRS.length; // 26
+
+// Pre-build fake viewMatrix for each canonical direction (worker only reads row 2,6,10,14)
+const FAKE_VMS = CANONICAL_DIRS.map(d => {
+    const vm = new Float32Array(16);
+    vm[2] = d[0]; vm[6] = d[1]; vm[10] = d[2]; vm[14] = 0;
+    return vm;
+});
+
+function findClosestDir(vm) {
+    const vx = vm[2], vy = vm[6], vz = vm[10];
+    const len = Math.sqrt(vx*vx + vy*vy + vz*vz) || 1;
+    const nx = vx/len, ny = vy/len, nz = vz/len;
+    let best = 0, bestDot = -2;
+    for (let i = 0; i < NUM_DIRS; i++) {
+        const d = CANONICAL_DIRS[i];
+        const dot = nx*d[0] + ny*d[1] + nz*d[2];
+        if (dot > bestDot) { bestDot = dot; best = i; }
+    }
+    return best;
+}
+
+// Worker pool (uses all available cores)
+const POOL_SIZE = Math.min(navigator.hardwareConcurrency || 4, 8);
+const pool = [];
+const poolBusy = new Array(POOL_SIZE).fill(false);
+const poolTask = new Array(POOL_SIZE).fill(null); // { frameIdx, dirIdx }
+let needsRender = true;
+let taskQueue = []; // [{ frameIdx, dirIdx }]
+let preSortComplete = false;
+
+for (let i = 0; i < POOL_SIZE; i++) {
+    const w = new Worker(URL.createObjectURL(workerBlob));
+    w.onmessage = ((id) => (e) => {
+        const task = poolTask[id];
+        poolBusy[id] = false;
+        poolTask[id] = null;
+
+        if (task && task.frameIdx < frames.length) {
+            const frame = frames[task.frameIdx];
+            if (!frame.dirCache) frame.dirCache = new Array(NUM_DIRS).fill(null);
+            frame.dirCache[task.dirIdx] = e.data.indices;
+
+            // If this is the current frame and direction matches closest, upload now
+            if (task.frameIdx === currentFrame) {
+                const closestDir = findClosestDir(camera.viewMatrix);
+                if (task.dirIdx === closestDir) {
+                    renderer.uploadSortIndices(e.data.indices);
+                    needsRender = true;
+                }
+            }
+        }
+        drainQueue();
+    })(i);
+    pool.push(w);
+}
+
+function drainQueue() {
+    while (taskQueue.length > 0) {
+        let wid = -1;
+        for (let i = 0; i < POOL_SIZE; i++) { if (!poolBusy[i]) { wid = i; break; } }
+        if (wid === -1) return;
+        const task = taskQueue.shift();
+        if (task.frameIdx >= frames.length) continue;
+        const frame = frames[task.frameIdx];
+        if (frame.dirCache && frame.dirCache[task.dirIdx]) continue; // already done
+        poolBusy[wid] = true;
+        poolTask[wid] = task;
+        pool[wid].postMessage({
+            viewMatrix: FAKE_VMS[task.dirIdx],
+            positions: frame.positions,
+            count: frame.vertexCount
+        });
+    }
+    // Check if all pre-sorting is complete
+    if (!preSortComplete && frames.length > 0) {
+        let allDone = true;
+        outer: for (const frame of frames) {
+            if (!frame.dirCache) { allDone = false; break; }
+            for (let d = 0; d < NUM_DIRS; d++) {
+                if (!frame.dirCache[d]) { allDone = false; break outer; }
+            }
+        }
+        if (allDone) preSortComplete = true;
+    }
+}
+
+// Build the full pre-sort queue: closest direction first, then spiral outward
+function buildPreSortQueue() {
+    taskQueue = [];
+    preSortComplete = false;
+    const closestDir = findClosestDir(camera.viewMatrix);
+    // Priority 1: closest direction for ALL frames (enables flicker-free playback ASAP)
+    for (let fi = 0; fi < frames.length; fi++) {
+        taskQueue.push({ frameIdx: fi, dirIdx: closestDir });
+    }
+    // Priority 2: neighboring directions sorted by distance to closest
+    const dirOrder = [];
+    for (let d = 0; d < NUM_DIRS; d++) {
+        if (d === closestDir) continue;
+        const cd = CANONICAL_DIRS[closestDir], dd = CANONICAL_DIRS[d];
+        const dot = cd[0]*dd[0] + cd[1]*dd[1] + cd[2]*dd[2];
+        dirOrder.push({ d, dot });
+    }
+    dirOrder.sort((a, b) => b.dot - a.dot); // closest neighbors first
+    for (const { d } of dirOrder) {
+        for (let fi = 0; fi < frames.length; fi++) {
+            taskQueue.push({ frameIdx: fi, dirIdx: d });
+        }
+    }
+    drainQueue();
+}
+
+// Reprioritize: when camera moves, push closest direction to front
+function requestSort() {
+    if (frames.length === 0) return;
+    const closestDir = findClosestDir(camera.viewMatrix);
+    // Extract tasks for the new closest direction, put them first
+    const urgent = [];
+    const rest = [];
+    for (const t of taskQueue) {
+        if (t.dirIdx === closestDir) urgent.push(t);
+        else rest.push(t);
+    }
+    // Also ensure all frames have the closest direction queued
+    for (let fi = 0; fi < frames.length; fi++) {
+        const frame = frames[fi];
+        if (frame.dirCache && frame.dirCache[closestDir]) continue;
+        if (!urgent.some(t => t.frameIdx === fi)) {
+            urgent.push({ frameIdx: fi, dirIdx: closestDir });
+        }
+    }
+    taskQueue = [...urgent, ...rest];
+    drainQueue();
+}
+
+// Find best available sort for a frame at the current camera angle
+function getBestSortForFrame(frameIdx) {
+    const frame = frames[frameIdx];
+    if (!frame) return null;
+    const vm = camera.viewMatrix;
+    const vx = vm[2], vy = vm[6], vz = vm[10];
+    const len = Math.sqrt(vx*vx + vy*vy + vz*vz) || 1;
+    const nx = vx/len, ny = vy/len, nz = vz/len;
+
+    if (frame.dirCache) {
+        let bestIdx = -1, bestDot = -2;
+        for (let i = 0; i < NUM_DIRS; i++) {
+            if (!frame.dirCache[i]) continue;
+            const d = CANONICAL_DIRS[i];
+            const dot = nx*d[0] + ny*d[1] + nz*d[2];
+            if (dot > bestDot) { bestDot = dot; bestIdx = i; }
+        }
+        if (bestIdx >= 0) return frame.dirCache[bestIdx];
+    }
+    // Last resort: identity (only before any sorting completes)
+    if (!frame._identity) {
+        frame._identity = new Uint32Array(frame.vertexCount);
+        for (let i = 0; i < frame.vertexCount; i++) frame._identity[i] = i;
+    }
+    return frame._identity;
+}
+
+function getPreSortProgress() {
+    let done = 0;
+    const total = frames.length * NUM_DIRS;
+    for (const frame of frames) {
+        if (!frame.dirCache) continue;
+        for (let d = 0; d < NUM_DIRS; d++) { if (frame.dirCache[d]) done++; }
+    }
+    return { done, total };
+}
+
+function resetSortCache() {
+    // Compatibility stub
+}
+
+// =============================================================================
+// Multi-Frame Playback System
+// =============================================================================
+const frames = [];
+let currentFrame = 0;
+let isPlaying = false;
+let playbackFps = 24;
+let lastPlayTime = 0;
+let sceneFitted = false;
+
+const playBar = document.getElementById('play-bar');
+const playBtn = document.getElementById('playBtn');
+const frameSlider = document.getElementById('frameSlider');
+const frameLabel = document.getElementById('frameLabel');
+const fpsSlider = document.getElementById('fpsSlider');
+const fpsVal = document.getElementById('fpsVal');
+
+function updatePlayUI() {
+    playBtn.innerHTML = isPlaying ? '&#9646;&#9646;' : '&#9654;';
+    frameSlider.max = Math.max(0, frames.length - 1);
+    frameSlider.value = currentFrame;
+    frameLabel.textContent = `${currentFrame + 1} / ${frames.length}`;
+}
+
+function switchToFrame(idx) {
+    if (frames.length === 0) return;
+    currentFrame = idx % frames.length;
+    const sortIndices = getBestSortForFrame(currentFrame);
+    renderer.activateFrame(frames[currentFrame], sortIndices);
+    needsRender = true;
+    updatePlayUI();
+}
+
+playBtn.addEventListener('click', () => {
+    if (frames.length < 2) return;
+    isPlaying = !isPlaying;
+    lastPlayTime = performance.now();
+    updatePlayUI();
+});
+
+frameSlider.addEventListener('input', () => {
+    switchToFrame(parseInt(frameSlider.value));
+});
+
+fpsSlider.addEventListener('input', () => {
+    playbackFps = parseInt(fpsSlider.value);
+    fpsVal.textContent = playbackFps;
+});
+
+window.addEventListener('keydown', e => {
+    if (e.code === 'Space' && frames.length >= 2) {
+        e.preventDefault();
+        isPlaying = !isPlaying;
+        lastPlayTime = performance.now();
+        updatePlayUI();
+    }
+});
+
+function fitCameraToData(data) {
+    const pos = data.positions;
+    const n = data.vertexCount;
+    let mx = 0, my = 0, mz = 0;
+    for (let i = 0; i < n; i++) { mx += pos[i*3]; my += pos[i*3+1]; mz += pos[i*3+2]; }
+    mx /= n; my /= n; mz /= n;
+    let maxR = 0;
+    for (let i = 0; i < n; i++) {
+        const dx = pos[i*3]-mx, dy = pos[i*3+1]-my, dz = pos[i*3+2]-mz;
+        const r = Math.sqrt(dx*dx+dy*dy+dz*dz);
+        if (r > maxR) maxR = r;
+    }
+    camera.fitScene([mx, my, mz], maxR || 1);
+    camera.updateMatrices();
+    camera.dirty = true;
+}
+
+function loadFilesSequentially(fileList, index) {
+    if (index >= fileList.length) {
+        loadingEl.style.display = 'none';
+        // Pre-sort all frames for all 26 directions in background
+        buildPreSortQueue();
+        return;
+    }
+    const file = fileList[index];
+    loadingEl.style.display = 'block';
+    loadingEl.textContent = `Loading ${index + 1}/${fileList.length}: ${file.name}...`;
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        try {
+            const name = file.name.toLowerCase();
+            if (name.endsWith('.txt')) {
+                const cams = parseImagesTxt(e.target.result);
+                if (cams.length > 0) {
+                    extrinsicCameras = cams;
+                    extrinsicIndex = 0;
+                    applyCameraExtrinsic();
+                    camNav.classList.add('visible');
+                }
+                loadFilesSequentially(fileList, index + 1);
+                return;
+            }
+            const buffer = e.target.result;
+            const isSplat = name.endsWith('.splat');
+            const data = isSplat ? parseSplat(buffer) : parsePly(buffer);
+
+            loadingEl.textContent = `Baking frame ${frames.length + 1}/${fileList.length}: ${data.vertexCount.toLocaleString()} gaussians...`;
+
+            setTimeout(() => {
+                const frame = renderer.bakeFrame(data);
+                frames.push(frame);
+                if (!sceneFitted) { fitCameraToData(data); sceneFitted = true; }
+                if (frames.length === 1) switchToFrame(0);
+                playBar.classList.add('visible');
+                updatePlayUI();
+                infoEl.textContent = `${frames.length} frames | ${data.vertexCount.toLocaleString()} gaussians/frame`;
+                loadFilesSequentially(fileList, index + 1);
+            }, 5);
+        } catch(err) {
+            loadingEl.textContent = 'Error: ' + err.message;
+            console.error(err);
+            loadFilesSequentially(fileList, index + 1);
+        }
+    };
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.txt')) reader.readAsText(file);
+    else reader.readAsArrayBuffer(file);
+}
+
+// Load file (single)
+function loadFile(file) {
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.txt')) {
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            try {
+                const cams = parseImagesTxt(e.target.result);
+                if (cams.length === 0) { alert('No camera entries found in file'); return; }
+                extrinsicCameras = cams;
+                extrinsicIndex = 0;
+                applyCameraExtrinsic();
+                camNav.classList.add('visible');
+            } catch(err) { alert('Failed to parse images.txt: ' + err.message); }
+        };
+        reader.readAsText(file);
+        return;
+    }
+
+    loadingEl.style.display = 'block';
+    loadingEl.textContent = `Loading ${file.name}...`;
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        try {
+            const buffer = e.target.result;
+            const isSplat = file.name.toLowerCase().endsWith('.splat');
+            const data = isSplat ? parseSplat(buffer) : parsePly(buffer);
+
+            loadingEl.textContent = `Baking frame: ${data.vertexCount.toLocaleString()} gaussians...`;
+
+            setTimeout(() => {
+                try {
+                    const frame = renderer.bakeFrame(data);
+                    frames.push(frame);
+                    if (!sceneFitted) { fitCameraToData(data); sceneFitted = true; }
+                    switchToFrame(frames.length - 1);
+                    playBar.classList.add('visible');
+                    updatePlayUI();
+                    buildPreSortQueue();
+                    loadingEl.style.display = 'none';
+                    infoEl.textContent = `${frames.length} frames | ${data.vertexCount.toLocaleString()} gaussians`;
+                } catch(err) {
+                    loadingEl.textContent = 'Error: ' + err.message;
+                    console.error(err);
+                }
+            }, 10);
+        } catch(err) {
+            loadingEl.textContent = 'Error: ' + err.message;
+            console.error(err);
+        }
+    };
+    reader.readAsArrayBuffer(file);
+}
+
+// UI events
+loadBtn.addEventListener('click', () => {
+    frames.length = 0;
+    currentFrame = 0;
+    sceneFitted = false;
+    isPlaying = false;
+    fileInput.click();
+});
+fileInput.addEventListener('change', (e) => {
+    const files = Array.from(e.target.files).sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}));
+    if (files.length > 1) {
+        frames.length = 0; currentFrame = 0; sceneFitted = false; isPlaying = false;
+        loadFilesSequentially(files, 0);
+    } else {
+        for (const f of files) loadFile(f);
+    }
+});
+
+const loadCamBtn = document.getElementById('loadCamBtn');
+const camFileInput = document.getElementById('camFileInput');
+loadCamBtn.addEventListener('click', () => camFileInput.click());
+camFileInput.addEventListener('change', (e) => { for (const f of e.target.files) loadFile(f); });
+
+const ringBtn = document.getElementById('ringBtn');
+const pointsBtn = document.getElementById('pointsBtn');
+const ringSizeGroup = document.getElementById('ringSizeGroup');
+const ringSizeSlider = document.getElementById('ringSizeSlider');
+const ringSizeVal = document.getElementById('ringSizeVal');
+const pointSizeGroup = document.getElementById('pointSizeGroup');
+const pointSizeSlider = document.getElementById('pointSizeSlider');
+const pointSizeVal = document.getElementById('pointSizeVal');
+
+function updateModeUI() {
+    ringBtn.classList.toggle('active', renderer.ringMode);
+    pointsBtn.classList.toggle('active', renderer.pointsMode);
+    ringSizeGroup.classList.toggle('visible', renderer.ringMode);
+    pointSizeGroup.classList.toggle('visible', renderer.pointsMode);
+}
+
+ringBtn.addEventListener('click', () => {
+    renderer.ringMode = !renderer.ringMode;
+    if (renderer.ringMode) renderer.pointsMode = false;
+    updateModeUI();
+});
+
+pointsBtn.addEventListener('click', () => {
+    renderer.pointsMode = !renderer.pointsMode;
+    if (renderer.pointsMode) renderer.ringMode = false;
+    updateModeUI();
+});
+
+ringSizeSlider.addEventListener('input', () => {
+    renderer.ringSize = parseFloat(ringSizeSlider.value);
+    ringSizeVal.textContent = renderer.ringSize.toFixed(2);
+});
+
+pointSizeSlider.addEventListener('input', () => {
+    renderer.pointSize = parseFloat(pointSizeSlider.value);
+    pointSizeVal.textContent = renderer.pointSize.toFixed(1);
+});
+
+// Camera extrinsics navigation
+let extrinsicCameras = [];
+let extrinsicIndex = 0;
+const camNav = document.getElementById('cam-nav');
+const camLabel = document.getElementById('camLabel');
+const camPrevBtn = document.getElementById('camPrevBtn');
+const camNextBtn = document.getElementById('camNextBtn');
+
+function applyCameraExtrinsic() {
+    if (extrinsicCameras.length === 0) return;
+    camera.setFromExtrinsics(extrinsicCameras[extrinsicIndex]);
+    camLabel.textContent = extrinsicIndex + 1;
+    needsRender = true;
+}
+
+camPrevBtn.addEventListener('click', () => {
+    if (extrinsicCameras.length === 0) return;
+    extrinsicIndex = (extrinsicIndex - 1 + extrinsicCameras.length) % extrinsicCameras.length;
+    applyCameraExtrinsic();
+});
+
+camNextBtn.addEventListener('click', () => {
+    if (extrinsicCameras.length === 0) return;
+    extrinsicIndex = (extrinsicIndex + 1) % extrinsicCameras.length;
+    applyCameraExtrinsic();
+});
+
+// Drag & drop (support multiple files: .ply/.splat + .txt)
+let dragCounter = 0;
+document.addEventListener('dragenter', (e) => { e.preventDefault(); dragCounter++; dropOverlay.classList.add('active'); });
+document.addEventListener('dragleave', (e) => { e.preventDefault(); if (--dragCounter <= 0) { dragCounter=0; dropOverlay.classList.remove('active'); } });
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dragCounter = 0;
+    dropOverlay.classList.remove('active');
+    const files = Array.from(e.dataTransfer.files).sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}));
+    const plyFiles = files.filter(f => { const n = f.name.toLowerCase(); return n.endsWith('.ply') || n.endsWith('.splat'); });
+    const txtFiles = files.filter(f => f.name.toLowerCase().endsWith('.txt'));
+    for (const f of txtFiles) loadFile(f);
+    if (plyFiles.length > 1) {
+        frames.length = 0; currentFrame = 0; sceneFitted = false; isPlaying = false;
+        loadFilesSequentially(plyFiles, 0);
+    } else {
+        for (const f of plyFiles) loadFile(f);
+    }
+});
+
+// FPS counter
+let frameCount = 0, lastFpsTime = performance.now();
+let lastFrameTime = performance.now();
+
+// Render loop
+function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min((now - lastFrameTime) / 1000, 0.1);
+    lastFrameTime = now;
+
+    camera.processKeys(dt);
+    camera.smoothUpdate(dt);
+    camera.updateMatrices();
+
+    if (camera.dirty) {
+        camera.dirty = false;
+        // Instantly upload best cached sort for current frame (zero latency)
+        if (frames.length > 0) {
+            const sort = getBestSortForFrame(currentFrame);
+            renderer.uploadSortIndices(sort);
+        }
+        requestSort(); // Reprioritize queue for new view direction
+        needsRender = true;
+    }
+
+    // Multi-frame playback
+    if (isPlaying && frames.length >= 2) {
+        const interval = 1000 / playbackFps;
+        if (now - lastPlayTime >= interval) {
+            lastPlayTime = now - ((now - lastPlayTime) % interval);
+            switchToFrame((currentFrame + 1) % frames.length);
+        }
+    }
+
+    // Keep worker pool busy
+    drainQueue();
+
+    // Only render when something changed (camera moved, new sort result, etc.)
+    if (needsRender || camera.moving || camera.keys.size > 0 || isPlaying) {
+        needsRender = false;
+        renderer.render(camera);
+    }
+
+    // FPS
+    frameCount++;
+    if (now - lastFpsTime > 1000) {
+        const fps = Math.round(frameCount * 1000 / (now - lastFpsTime));
+        const frameInfo = frames.length > 1 ? `Frame ${currentFrame+1}/${frames.length} | ` : '';
+        const base = renderer.splatCount > 0 ? `${renderer.splatCount.toLocaleString()} gaussians` : 'No data';
+        let sortInfo = '';
+        if (frames.length > 0 && !preSortComplete) {
+            const p = getPreSortProgress();
+            sortInfo = ` | Sort ${Math.round(p.done/p.total*100)}%`;
+        }
+        infoEl.textContent = `${frameInfo}${base} | ${fps} FPS${sortInfo}`;
+        frameCount = 0;
+        lastFpsTime = now;
+    }
+}
+
+frame(performance.now());
+
+// =============================================================================
+// Streaming Download with Progress UI
+// =============================================================================
+const progOverlay = document.getElementById('progress-overlay');
+const progFill = document.getElementById('prog-fill');
+const progPct = document.getElementById('prog-pct');
+const progSizeEl = document.getElementById('prog-size');
+const progFilename = document.getElementById('prog-filename');
+const progStatus = document.getElementById('prog-status');
+const progTitleEl = document.getElementById('prog-title');
+const progSteps = [document.getElementById('step0'), document.getElementById('step1'), document.getElementById('step2')];
+
+function fmtBytes(b) {
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1048576).toFixed(1) + ' MB';
+}
+
+function setStep(idx, state) {
+    progSteps.forEach((s, i) => {
+        s.classList.remove('active', 'done');
+        if (i < idx) s.classList.add('done');
+        else if (i === idx && state === 'active') s.classList.add('active');
+        else if (i === idx && state === 'done') s.classList.add('done');
+    });
+}
+
+function showProg(title, filename, pct, received, total, status) {
+    progOverlay.classList.add('active');
+    progOverlay.classList.remove('hiding');
+    progTitleEl.textContent = title;
+    progFilename.textContent = filename;
+    progFill.classList.remove('indeterminate', 'parsing');
+    if (pct >= 0) {
+        progFill.style.width = Math.min(100, pct * 100).toFixed(1) + '%';
+        progPct.textContent = Math.round(pct * 100) + '%';
+    } else {
+        progFill.classList.add('indeterminate');
+        progPct.textContent = fmtBytes(received);
+    }
+    progSizeEl.textContent = total > 0 ? `${fmtBytes(received)} / ${fmtBytes(total)}` : (received > 0 ? fmtBytes(received) : '');
+    progStatus.textContent = status || '';
+    progPct.style.color = '';
+}
+
+function showParsing(title, status) {
+    progTitleEl.textContent = title;
+    progFill.classList.remove('indeterminate');
+    progFill.classList.add('parsing');
+    progPct.textContent = '';
+    progSizeEl.textContent = '';
+    progStatus.textContent = status || 'Processing...';
+}
+
+function hideProg() {
+    progOverlay.classList.add('hiding');
+    setTimeout(() => {
+        progOverlay.classList.remove('active', 'hiding');
+        progFill.style.width = '0%';
+        progFill.classList.remove('indeterminate', 'parsing');
+    }, 600);
+}
+
+async function streamFetch(url, onProgress) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+    const contentLength = parseInt(resp.headers.get('Content-Length') || '0', 10);
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        const pct = contentLength > 0 ? received / contentLength : -1;
+        if (onProgress) onProgress(pct, received, contentLength);
+    }
+    const merged = new Uint8Array(received);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    return merged.buffer;
+}
+
+// Auto-load data from HuggingFace
+(async function autoLoad() {
+    const TXT_URL = 'https://huggingface.co/datasets/mumber132/gsdata/resolve/main/images.txt';
+    const PLY_URL = 'https://huggingface.co/datasets/mumber132/gsdata/resolve/main/1000.ply';
+
+    try {
+        // Step 1: Load cameras
+        setStep(0, 'active');
+        showProg('Loading Camera Data', 'images.txt', -1, 0, 0, 'Connecting...');
+        const txtBuf = await streamFetch(TXT_URL, (pct, recv, total) => {
+            showProg('Loading Camera Data', 'images.txt', pct, recv, total, 'Downloading camera data...');
+        });
+        showParsing('Parsing Camera Data', 'Reading camera extrinsics...');
+        await new Promise(r => setTimeout(r, 200));
+        const txtStr = new TextDecoder().decode(new Uint8Array(txtBuf));
+        const cams = parseImagesTxt(txtStr);
+        if (cams.length > 0) {
+            extrinsicCameras = cams;
+            extrinsicIndex = 0;
+            camNav.classList.add('visible');
+        }
+        setStep(0, 'done');
+
+        // Step 2: Stream-load PLY
+        setStep(1, 'active');
+        showProg('Loading 3D Gaussians', '1000.ply', 0, 0, 0, 'Connecting...');
+        const plyBuf = await streamFetch(PLY_URL, (pct, recv, total) => {
+            showProg('Loading 3D Gaussians', '1000.ply', pct, recv, total, 'Streaming gaussian data...');
+        });
+
+        // Step 3: Parse & bake
+        setStep(1, 'done');
+        setStep(2, 'active');
+        showParsing('Processing Gaussians', 'Parsing PLY data...');
+        await new Promise(r => setTimeout(r, 50));
+        const data = parsePly(plyBuf);
+
+        showParsing('Processing Gaussians', `Baking ${data.vertexCount.toLocaleString()} gaussians...`);
+        await new Promise(r => setTimeout(r, 50));
+        const frame = renderer.bakeFrame(data);
+        frames.push(frame);
+        fitCameraToData(data);
+        sceneFitted = true;
+        switchToFrame(0);
+        playBar.classList.add('visible');
+        updatePlayUI();
+        buildPreSortQueue();
+
+        setStep(2, 'done');
+        progTitleEl.textContent = 'Ready!';
+        progStatus.textContent = `${data.vertexCount.toLocaleString()} gaussians loaded`;
+        progPct.textContent = '\u2714';
+        progPct.style.color = '#4ade80';
+        progFill.classList.remove('parsing');
+        progFill.style.width = '100%';
+        await new Promise(r => setTimeout(r, 800));
+        hideProg();
+        infoEl.textContent = `${data.vertexCount.toLocaleString()} gaussians`;
+    } catch (err) {
+        console.error('Auto-load failed:', err);
+        progTitleEl.textContent = 'Loading Failed';
+        progFill.classList.remove('indeterminate', 'parsing');
+        progFill.style.width = '0%';
+        progStatus.textContent = err.message;
+        progPct.textContent = '\u2717';
+        progPct.style.color = '#f87171';
+    }
+})();
+</script>
+</body>
+</html>
