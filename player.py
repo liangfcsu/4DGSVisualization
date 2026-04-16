@@ -331,7 +331,7 @@ class MainWindow(QMainWindow):
         if torch.cuda.is_available():
             self.ui_state.gpu_name = torch.cuda.get_device_name(0)
         if seq:
-            self.ui_state.load_mode = seq.load_mode
+            self.ui_state.load_mode = "gpu_stream" if getattr(seq, '_gpu_stream_mode', False) else seq.load_mode
             self.ui_state.playback_fps = seq.fps
 
         self.setWindowTitle(f"4DGS Viewer · {self.ui_state.scene_name}")
@@ -1199,8 +1199,8 @@ def _build_objects(args):
             sh_degree     = sh_degree,
             playback_fps  = playback_fps,
             load_mode     = getattr(args, 'load_mode', SequenceManager.LOAD_MODE_AUTO),
-            gpu_cache_size= _core.clamp_positive_int(getattr(args, 'gpu_cache_size',  4), 4),
-            cpu_cache_size= _core.clamp_positive_int(getattr(args, 'cpu_cache_size',  8), 8),
+            gpu_cache_size= _core.clamp_positive_int(getattr(args, 'gpu_cache_size', 10), 10),
+            cpu_cache_size= _core.clamp_positive_int(getattr(args, 'cpu_cache_size',  3),  3),
             prefetch_count= max(0, int(getattr(args, 'prefetch_count', 2))),
             io_workers    = io_workers,
             pin_memory    = not getattr(args, 'no_pin_memory', False),

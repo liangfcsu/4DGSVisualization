@@ -1267,6 +1267,7 @@ class SequenceManager:
     
     LOAD_MODE_AUTO = "auto"
     LOAD_MODE_STREAM = "stream"
+    LOAD_MODE_GPU_STREAM = "gpu_stream"
     LOAD_MODE_PRELOAD_CPU = "preload_cpu"
     LOAD_MODE_PRELOAD_GPU = "preload_gpu"
     AUTO_STREAM_MIN_BYTES = 12 * 1024 ** 3
@@ -1438,7 +1439,23 @@ class SequenceManager:
                             self.load_backend = "cache"
                             print(f"播放器缓存已就绪: {self.cache_dir}")
         
+        self._gpu_stream_mode = False  # 标记是否为 GPU Stream 模式
         self.load_mode = self._resolve_load_mode(load_mode)
+
+        # GPU Stream 模式: 转化为优化参数的 stream 模式
+        if self.load_mode == self.LOAD_MODE_GPU_STREAM:
+            self._gpu_stream_mode = True
+            self.gpu_cache_size = max(self.gpu_cache_size, 10)
+            # CPU 缓存仅作中转暂存 (GPU窗口前方 3 帧)
+            self._gpu_stream_staging = 3
+            self.cpu_cache_size = self._gpu_stream_staging
+            self.backward_prefetch = 0
+            self.adaptive_prefetch = False
+            self.prefetch_count = self.gpu_cache_size + self._gpu_stream_staging
+            self.max_pending_cpu = max(self.prefetch_count, self.io_workers)
+            # 内部使用 stream 基础设施
+            self.load_mode = self.LOAD_MODE_STREAM
+
         if self.load_mode == self.LOAD_MODE_STREAM:
             self.backward_prefetch = 0
             self.adaptive_prefetch = False
@@ -1451,6 +1468,35 @@ class SequenceManager:
             self._preload_all_frames_to_gpu()
         elif self.load_mode == self.LOAD_MODE_PRELOAD_CPU:
             self._preload_all_frames_to_cpu()
+        elif self._gpu_stream_mode:
+            # ── GPU Stream 模式: 预加载前 N 帧到 GPU ──
+            self.executor = ThreadPoolExecutor(
+                max_workers=self.io_workers,
+                thread_name_prefix="gpu-stream-loader",
+            )
+            gpu_preload_count = min(self.gpu_cache_size, self.num_frames)
+            print(f"使用 GPU Stream 模式: GPU常驻 {self.gpu_cache_size} 帧滑动窗口 + CPU暂存 {self._gpu_stream_staging} 帧")
+            print(
+                f"  目标播放FPS: {self.fps:.1f}, IO线程: {self.io_workers}, 数据源: {self.load_backend}"
+            )
+            print(f"  正在预加载前 {gpu_preload_count} 帧到 GPU...")
+            preload_start = time.time()
+            for i in range(gpu_preload_count):
+                frame = self._load_frame_cpu_sync(i, verbose=(i == 0))
+                if i == 0:
+                    self.scene_center = frame.scene_center.copy()
+                    self.scene_extent = frame.scene_extent
+                    self.active_sh_degree = frame.sh_degree
+                    self.current_point_count = frame.point_count
+                    self.sampled_point_count = frame.sampled_count
+                frame_gpu = frame.to_device("cuda", non_blocking=False)
+                self.gpu_cache[i] = frame_gpu
+                if (i + 1) % 5 == 0 or i == gpu_preload_count - 1:
+                    print(f"  GPU 预加载: {i + 1}/{gpu_preload_count}")
+            preload_time = time.time() - preload_start
+            print(f"  GPU 预加载完成: {len(self.gpu_cache)} 帧已在 GPU ({preload_time:.1f}s)")
+            # 开始预取 GPU 窗口后方的暂存帧
+            self.prefetch_around(0)
         else:
             self.executor = ThreadPoolExecutor(
                 max_workers=self.io_workers,
@@ -1486,6 +1532,7 @@ class SequenceManager:
             total_ram_bytes = None
         available_ram_bytes = get_available_ram_bytes()
 
+        # 有 packed 缓存且序列较大 → 优先 GPU Stream 模式
         if (
             self.load_backend == "packed"
             and (
@@ -1494,10 +1541,10 @@ class SequenceManager:
             )
         ):
             print(
-                "自动选择 stream 模式: 已有顺序缓存且序列较大，优先快速进入 + 滑动窗口预读"
+                "自动选择 gpu_stream 模式: 已有顺序缓存且序列较大，GPU常驻滑动窗口"
                 f" (序列 {self.total_sequence_bytes / (1024 ** 3):.2f} GB, 帧数 {self.num_frames})"
             )
-            return self.LOAD_MODE_STREAM
+            return self.LOAD_MODE_GPU_STREAM
         
         if available_ram_bytes is not None:
             safe_available_budget = int(available_ram_bytes * 0.7)
@@ -1516,8 +1563,8 @@ class SequenceManager:
             )
             return self.LOAD_MODE_PRELOAD_CPU
         
-        print("自动选择 stream 模式: 序列较大或无法判断内存容量，使用流式缓存")
-        return self.LOAD_MODE_STREAM
+        print("自动选择 gpu_stream 模式: 序列较大或无法判断内存容量，使用GPU流式缓存")
+        return self.LOAD_MODE_GPU_STREAM
     
     def _frame_path(self, frame_idx):
         return self.frame_paths[frame_idx % self.num_frames]
@@ -2061,6 +2108,20 @@ class SequenceManager:
     
     def get_cache_status(self):
         if self.load_mode == self.LOAD_MODE_STREAM:
+            if self._gpu_stream_mode:
+                # GPU Stream 模式: 显示 GPU 窗口范围
+                gpu_frames = self._gpu_window_frames()
+                if gpu_frames:
+                    start_idx = gpu_frames[0] + 1
+                    end_idx = gpu_frames[-1] + 1
+                    window_desc = f"GPU窗口:{start_idx}->{end_idx}"
+                else:
+                    window_desc = "GPU窗口:-"
+                return (
+                    f"gpu_stream/{self.load_backend} | GPU {len(self.gpu_cache)}/{self.gpu_cache_size} | "
+                    f"暂存 {len(self.cpu_cache)} (+{len(self.pending_cpu)}) | "
+                    f"{window_desc} | IO x{self.io_workers}"
+                )
             window_frames = self._cpu_window_frames()
             if window_frames:
                 start_idx = window_frames[0] + 1
@@ -3677,8 +3738,8 @@ def main():
             sh_degree=sh_degree,
             playback_fps=args.playback_fps,
             load_mode=args.load_mode,
-            gpu_cache_size=clamp_positive_int(args.gpu_cache_size, 2),
-            cpu_cache_size=clamp_positive_int(args.cpu_cache_size, 2),
+            gpu_cache_size=clamp_positive_int(args.gpu_cache_size, 10),
+            cpu_cache_size=clamp_positive_int(args.cpu_cache_size, 3),
             prefetch_count=max(0, int(args.prefetch_count)),
             pin_memory=not args.no_pin_memory,
             max_gaussians=args.max_gaussians,
