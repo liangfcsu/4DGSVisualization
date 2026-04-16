@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-4DGS Interactive Player — Qt UI 交互式播放器
+4DGS Interactive Player — Qt UI 交互式播放器 (Refactored)
 
 用法:
-    python player.py /home/lf/algorithm/3dgs/3dgsalgotithm/CodeReading/gaussian-splatting/output/douyinhuaban/output01/global_per_frame_ply
+    python player.py /path/to/global_per_frame_ply
     python player.py data/1/window_000/per_frame_ply --render-resolution 4k --playback-fps 30
     python player.py data/1/window_000/per_frame_ply --load-mode stream --gpu-cache-size 4
     python player.py point_cloud.ply --render-resolution 2k
-    python player.py <sequence_dir> --sparse data/sparse  # 加载 COLMAP 真实相机位姿
+    python player.py <sequence_dir> --sparse data/sparse
 
 快捷键:
     1/2/3/4      - 切换渲染分辨率 (720p/1080p/2K/4K)
-    G            - 切换显示模式 (高斯 / 点)
+    G            - 切换显示模式循环
     W/A/S/D      - 相机平移
     Q/E          - 上下
     I/K/J/L      - 旋转
@@ -26,7 +26,10 @@
     P            - 跳转到最近的相机位姿
     R            - 重置相机
     M            - 截图
-    F11          - 全屏
+    F / F11      - 全屏
+    Tab          - 隐藏/显示侧栏
+    H            - 隐藏/显示 HUD
+    Ctrl+Enter   - 演示模式
     Esc          - 退出
 """
 
@@ -40,7 +43,7 @@ from datetime import datetime
 import numpy as np
 import torch
 
-# ─── 第一步：加载核心模块（会间接 import cv2，cv2 会污染 QT_QPA_PLATFORM_PLUGIN_PATH）
+# ─── 第一步：加载核心模块 ──────────────────────────────────────────────────────
 _CORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "mult-frame_free-resolution_visualization.py")
 _spec = importlib.util.spec_from_file_location("viewer_core", _CORE_PATH)
@@ -53,10 +56,7 @@ GaussianPointCloud = _core.GaussianPointCloud
 GaussianRenderer   = _core.GaussianRenderer
 InteractiveCamera  = _core.InteractiveCamera
 
-# ─── 第二步：cv2 已被导入并可能污染了插件路径，在 PyQt5 导入前修正 ────────────
-# cv2-python 会在 import cv2 时把 QT_QPA_PLATFORM_PLUGIN_PATH 指向
-# cv2/qt/plugins（旧版 Qt），导致 PyQt5 的 xcb 插件无法加载并崩溃。
-# 必须在 cv2 import 完成之后、PyQt5 import 之前覆盖这个环境变量。
+# ─── 第二步：修正 Qt 插件路径 ─────────────────────────────────────────────────
 try:
     import PyQt5 as _PyQt5_probe
     for _sub in ("Qt5", "Qt"):
@@ -68,7 +68,7 @@ try:
 except Exception:
     pass
 
-# ─── 第三步：正常导入 PyQt5 ──────────────────────────────────────────────────
+# ─── 第三步：导入 PyQt5 ──────────────────────────────────────────────────────
 try:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -82,21 +82,44 @@ except ImportError:
     print("错误: 请先安装 PyQt5:  pip install PyQt5")
     sys.exit(1)
 
+# ─── 第四步：导入 UI 模块 ────────────────────────────────────────────────────
+from ui.state import (
+    UIState, RESOLUTION_OPTIONS, FPS_PRESETS,
+    VISUALIZATION_MODES, VIS_TO_RENDER_MODE, QUICK_VIS_MODES,
+    CAMERA_MODES, CAMERA_MODE_TO_INDEX,
+)
+from ui.style import GLOBAL_QSS, build_qss, F_CAPTION
+from ui.top_bar import TopBar
+from ui.left_panel import LeftControlPanel
+from ui.right_panel import RightInfoPanel
+from ui.bottom_timeline import BottomTimelineBar
+from ui.overlay_hud import ViewportOverlay
+from ui.widgets import ToastNotification
 
-# ─── 分辨率预设 ────────────────────────────────────────────────────────────────
-RESOLUTION_OPTIONS = [
-    ("720p    1280×720",  1280,  720),
-    ("1080p  1920×1080", 1920, 1080),
-    ("2K     2560×1440", 2560, 1440),
-    ("4K     3840×2160", 3840, 2160),
-]
 
-FPS_PRESETS = [10, 15, 24, 30, 60, 120]
-DISPLAY_MODE_OPTIONS = [
-    ("高斯", GaussianRenderer.RENDER_MODE_SPLAT),
-    ("点模式", GaussianRenderer.RENDER_MODE_POINTS),
-    ("Ring模式", GaussianRenderer.RENDER_MODE_RING),
-]
+# ─── 渲染模式映射 ─────────────────────────────────────────────────────────────
+RENDER_MODE_MAP = {
+    "splat":  GaussianRenderer.RENDER_MODE_SPLAT,
+    "points": GaussianRenderer.RENDER_MODE_POINTS,
+    "ring":   GaussianRenderer.RENDER_MODE_RING,
+}
+
+RENDER_MODE_REVERSE = {v: k for k, v in RENDER_MODE_MAP.items()}
+
+# vis_mode → render_mode constant
+def _vis_to_render_mode(vis_key: str):
+    rm_str = VIS_TO_RENDER_MODE.get(vis_key)
+    if rm_str and rm_str in RENDER_MODE_MAP:
+        return RENDER_MODE_MAP[rm_str]
+    return None
+
+# render_mode constant → vis_key
+def _render_mode_to_vis(render_mode) -> str:
+    rm_str = RENDER_MODE_REVERSE.get(render_mode, "")
+    for vis_key, rm in VIS_TO_RENDER_MODE.items():
+        if rm == rm_str:
+            return vis_key
+    return "rgb"
 
 
 def _recommended_io_workers() -> int:
@@ -109,185 +132,22 @@ CAMERA_MOTION_KEYS = {
     Qt.Key_J, Qt.Key_L, Qt.Key_U, Qt.Key_O,
 }
 
-PLAYER_QSS = """
-QMainWindow, QWidget#CentralShell {
-    background: #09111a;
-    color: #e7eef7;
-    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei";
+CAMERA_KEY_TO_MODE = {
+    "free":      InteractiveCamera.MODE_FPS,
+    "trackball": InteractiveCamera.MODE_TRACKBALL,
+    "orbit":     InteractiveCamera.MODE_ORBIT,
 }
-QMenuBar {
-    background: #0d1722;
-    color: #e7eef7;
-    border-bottom: 1px solid #223446;
-    padding: 4px 10px;
-}
-QMenuBar::item {
-    padding: 7px 12px;
-    border-radius: 8px;
-}
-QMenuBar::item:selected {
-    background: #172435;
-}
-QMenu {
-    background: #101a25;
-    color: #e7eef7;
-    border: 1px solid #24384b;
-    padding: 6px;
-}
-QMenu::item {
-    padding: 7px 16px;
-    border-radius: 8px;
-}
-QMenu::item:selected {
-    background: #18334a;
-}
-QToolBar#TopBar {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0f1a26, stop:1 #142536);
-    border: none;
-    border-bottom: 1px solid #24384b;
-    spacing: 8px;
-    padding: 10px 12px;
-}
-QFrame#RenderShell {
-    background: qradialgradient(cx:0.5, cy:0.2, radius:1.15, fx:0.5, fy:0.15, stop:0 #132132, stop:1 #09111a);
-}
-QFrame#ControlBar {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #101a25, stop:1 #162636);
-    border-top: 1px solid #24384b;
-}
-QStatusBar#AppStatusBar {
-    background: #0d1722;
-    color: #9cb4c9;
-    border-top: 1px solid #223446;
-}
-QLabel#SectionLabel {
-    color: #87a1ba;
-    font-size: 12px;
-    font-weight: 600;
-}
-QLabel#FrameCounter {
-    color: #f5f9fd;
-    font-size: 18px;
-    font-weight: 700;
-}
-QLabel#InfoLabel {
-    color: #d7e3ef;
-    background: #0d1620;
-    border: 1px solid #273b4f;
-    border-radius: 12px;
-    padding: 6px 10px;
-}
-QLabel#ShortcutHint {
-    color: #dce8f4;
-    background: rgba(19, 35, 52, 0.95);
-    border: 1px solid #31506e;
-    border-radius: 12px;
-    padding: 6px 12px;
-    font-size: 12px;
-    font-weight: 600;
-}
-QLabel#SceneBadge {
-    color: #e9f4ff;
-    background: #132236;
-    border: 1px solid #365779;
-    border-radius: 12px;
-    padding: 6px 12px;
-    font-weight: 600;
-}
-QPushButton {
-    background: #172536;
-    color: #eff7ff;
-    border: 1px solid #2b435a;
-    border-radius: 12px;
-    padding: 7px 12px;
-    min-height: 34px;
-}
-QPushButton:hover {
-    background: #203247;
-    border-color: #44637f;
-}
-QPushButton:pressed {
-    background: #132233;
-}
-QPushButton#PrimaryButton {
-    background: #1e6ee5;
-    border: 1px solid #418cff;
-}
-QPushButton#PrimaryButton:hover {
-    background: #3584ff;
-}
-QPushButton#TransportButton {
-    min-width: 38px;
-    min-height: 38px;
-    padding: 0px;
-    border-radius: 12px;
-}
-QPushButton#ChipButton {
-    min-width: 38px;
-    min-height: 28px;
-    padding: 0 8px;
-    border-radius: 10px;
-    background: #111b26;
-}
-QPushButton#ChipButton:hover {
-    background: #182736;
-}
-QPushButton:checked {
-    background: #1e6ee5;
-    border-color: #418cff;
-}
-QComboBox, QDoubleSpinBox {
-    background: #101923;
-    color: #f2f7fb;
-    border: 1px solid #2b435a;
-    border-radius: 12px;
-    padding: 6px 10px;
-    min-height: 34px;
-    selection-background-color: #1e6ee5;
-}
-QComboBox:hover, QDoubleSpinBox:hover {
-    border-color: #466884;
-}
-QComboBox::drop-down {
-    border: none;
-    width: 26px;
-}
-QSlider::groove:horizontal {
-    height: 6px;
-    background: #18283a;
-    border-radius: 3px;
-}
-QSlider::sub-page:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1e6ee5, stop:1 #49a5ff);
-    border-radius: 3px;
-}
-QSlider::handle:horizontal {
-    background: #f3f8ff;
-    width: 16px;
-    margin: -6px 0;
-    border-radius: 8px;
-    border: 2px solid #1e6ee5;
-}
-QToolTip {
-    background: #0d1620;
-    color: #e7eef7;
-    border: 1px solid #2a4055;
-    padding: 6px 8px;
-}
-"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RenderView — 渲染显示控件（鼠标交互）
 # ═══════════════════════════════════════════════════════════════════════════════
 class RenderView(QWidget):
-    """渲染区域控件：
-    - 显示 GPU 渲染结果（自动缩放到控件大小，保持宽高比，黑边填充）
-    - 捕获鼠标/键盘，驱动 InteractiveCamera
-    """
+    """渲染区域控件：显示 GPU 渲染结果，捕获鼠标/键盘驱动 InteractiveCamera"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("RenderView")
         self.setMinimumSize(320, 240)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -309,6 +169,10 @@ class RenderView(QWidget):
         self._last_pos = None
         self._trackball_ratio = 0.75
 
+        # Overlay references (set by MainWindow)
+        self._overlay = None
+        self._toast = None
+
     def set_camera(self, camera: InteractiveCamera):
         self.camera = camera
 
@@ -319,7 +183,7 @@ class RenderView(QWidget):
         return self._left or self._right or self._mid
 
     def update_image(self, rgb: np.ndarray):
-        """接受 (H, W, 3) uint8 RGB 数组，缩放后绘制"""
+        """接受 (H, W, 3) uint8 RGB 数组"""
         self._image_buffer = np.ascontiguousarray(rgb)
         h, w = self._image_buffer.shape[:2]
         qi = QImage(self._image_buffer.data, w, h, w * 3, QImage.Format_RGB888)
@@ -327,7 +191,7 @@ class RenderView(QWidget):
         self._scaled_pixmap = None
         self._scaled_size = None
         self._scaled_key = None
-        self.update()  # 触发 paintEvent
+        self.update()
 
     def paintEvent(self, event):
         from PyQt5.QtGui import QPainter
@@ -356,6 +220,11 @@ class RenderView(QWidget):
         self._scaled_size = None
         self._scaled_key = None
         super().resizeEvent(event)
+        # Reposition overlays
+        if self._overlay:
+            self._overlay.reposition(self.width(), self.height())
+        if self._toast:
+            self._toast.reposition()
 
     def _in_center(self, pos):
         cx, cy = self.width() / 2, self.height() / 2
@@ -418,7 +287,7 @@ class RenderView(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MainWindow — 主窗口
+# MainWindow — 主窗口 (使用模块化 UI 组件)
 # ═══════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
 
@@ -431,6 +300,7 @@ class MainWindow(QMainWindow):
         render_h:    int = 720,
     ):
         super().__init__()
+        # ── Core objects (不改动) ──
         self.renderer   = renderer
         self.camera     = camera
         self.seq        = seq
@@ -439,43 +309,61 @@ class MainWindow(QMainWindow):
         self.render_h   = render_h
         self._preferred_frame_device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # ── Runtime state ──
         self._fps_avg      = 0.0
         self._last_t       = time.time()
         self._keys_held: set = set()
-        self._seeking      = False
         self._needs_render = True
-        self._shortcuts = []
+        self._shortcuts    = []
+        self._last_event   = ""
+        self._update_counter = 0
 
-        self.setWindowTitle(f"4DGS Interactive Player · {self._scene_name()}")
+        # ── UI State ──
+        self.ui_state = UIState()
+        self.ui_state.scene_name = self._scene_name()
+        self.ui_state.project_mode = "4DGS" if seq else "3DGS"
+        self.ui_state.total_frames = seq.num_frames if seq else 1
+        self.ui_state.render_w = render_w
+        self.ui_state.render_h = render_h
+        self.ui_state.vis_mode = _render_mode_to_vis(renderer.render_mode)
+        self.ui_state.point_size = getattr(renderer, "point_size", 1.0)
+        self.ui_state.cpu_count = os.cpu_count() or 1
+        if torch.cuda.is_available():
+            self.ui_state.gpu_name = torch.cuda.get_device_name(0)
+        if seq:
+            self.ui_state.load_mode = seq.load_mode
+            self.ui_state.playback_fps = seq.fps
+
+        self.setWindowTitle(f"4DGS Viewer · {self.ui_state.scene_name}")
         self.setFocusPolicy(Qt.StrongFocus)
 
+        # ── Build UI ──
         self._build_menu()
-        self._build_toolbar()
-        self._build_central()
-        self._build_statusbar()
-        self._connect()
-        self._sync_resolution_combo()
-        self._sync_display_mode_combo()
+        self._build_ui()
+        self._connect_signals()
         self._install_shortcuts()
-        self._apply_window_theme()
+        self.setStyleSheet(build_qss())
         self._apply_initial_window_size()
 
-        # 渲染定时器
+        # Sync initial state
+        self._sync_initial_state()
+
+        # ── Timers ──
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._on_render)
         self._render_timer.start(8)          # ~120 Hz UI 轮询上限
 
-        # 相机连续运动定时器
         self._move_timer = QTimer(self)
         self._move_timer.timeout.connect(self._process_held_keys)
         self._move_timer.start(16)
 
-    # ─── UI 构建 ──────────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # UI Construction
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _build_menu(self):
         mb = self.menuBar()
 
-        # 文件
         fm = mb.addMenu("文件(&F)")
         a = QAction("截图 (&M)", self); a.setShortcut("M"); a.triggered.connect(self._screenshot)
         fm.addAction(a)
@@ -483,7 +371,6 @@ class MainWindow(QMainWindow):
         a = QAction("退出 (&Q)", self); a.setShortcut("Ctrl+Q"); a.triggered.connect(self.close)
         fm.addAction(a)
 
-        # 视图
         vm = mb.addMenu("视图(&V)")
         for label, w, h in RESOLUTION_OPTIONS:
             a = QAction(f"渲染: {label}", self)
@@ -492,227 +379,154 @@ class MainWindow(QMainWindow):
         vm.addSeparator()
         a = QAction("全屏 (&F11)", self); a.setShortcut("F11"); a.triggered.connect(self._toggle_fullscreen)
         vm.addAction(a)
+        vm.addSeparator()
+        a = QAction("隐藏/显示侧栏 (Tab)", self); a.triggered.connect(self._toggle_panels)
+        vm.addAction(a)
+        a = QAction("隐藏/显示 HUD (H)", self); a.triggered.connect(self._toggle_hud)
+        vm.addAction(a)
+        a = QAction("演示模式 (Ctrl+Enter)", self); a.triggered.connect(self._toggle_presentation)
+        vm.addAction(a)
 
-        # 帮助
         hm = mb.addMenu("帮助(&H)")
         a = QAction("快捷键说明", self); a.triggered.connect(self._show_help)
         hm.addAction(a)
 
-    def _build_toolbar(self):
-        tb = QToolBar("工具栏", self)
-        tb.setObjectName("TopBar")
-        tb.setMovable(False)
-        tb.setIconSize(QSize(18, 18))
-        self.addToolBar(Qt.TopToolBarArea, tb)
+    def _build_ui(self):
+        # ── Top Bar ──
+        self.top_bar = TopBar(self.ui_state, self)
+        self.addToolBar(Qt.TopToolBarArea, self.top_bar)
 
-        # 渲染分辨率
-        tb.addWidget(self._lbl("  渲染分辨率:"))
-        self.res_combo = QComboBox()
-        for label, *_ in RESOLUTION_OPTIONS:
-            self.res_combo.addItem(label)
-        self.res_combo.setMinimumWidth(170)
-        self.res_combo.setToolTip("渲染分辨率独立于窗口大小，窗口可自由拖动")
-        tb.addWidget(self.res_combo)
-
-        tb.addSeparator()
-
-        # 背景色
-        tb.addWidget(self._lbl(" 背景:"))
-        self.bg_combo = QComboBox()
-        self.bg_combo.addItems(["黑色", "白色"])
-        self.bg_combo.setFixedWidth(60)
-        tb.addWidget(self.bg_combo)
-
-        tb.addSeparator()
-
-        tb.addWidget(self._lbl(" 显示:"))
-        self.display_combo = QComboBox()
-        for label, _mode in DISPLAY_MODE_OPTIONS:
-            self.display_combo.addItem(label)
-        self.display_combo.setFixedWidth(96)
-        self.display_combo.setToolTip("切换高斯 / 点模式 (G)")
-        tb.addWidget(self.display_combo)
-
-        tb.addWidget(self._lbl(" 点大小:"))
-        self.point_size_spin = QDoubleSpinBox()
-        self.point_size_spin.setRange(0.25, 4.0)
-        self.point_size_spin.setSingleStep(0.25)
-        self.point_size_spin.setDecimals(2)
-        self.point_size_spin.setValue(getattr(self.renderer, "point_size", 1.0))
-        self.point_size_spin.setFixedWidth(62)
-        self.point_size_spin.setToolTip("点模式下的高斯尺寸倍率")
-        tb.addWidget(self.point_size_spin)
-
-        tb.addSeparator()
-
-        # 相机模式
-        tb.addWidget(self._lbl(" 相机模式:"))
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["FPS", "Trackball", "Orbit"])
-        self.mode_combo.setFixedWidth(90)
-        tb.addWidget(self.mode_combo)
-
-        tb.addSeparator()
-
-        # 重置相机
-        btn = QPushButton("↺ 重置")
-        btn.setToolTip("重置相机到初始位置 (R)")
-        btn.clicked.connect(self._reset_camera)
-        tb.addWidget(btn)
-
-        tb.addSeparator()
-
-        # 截图
-        btn2 = QPushButton("📷 截图")
-        btn2.setObjectName("PrimaryButton")
-        btn2.setToolTip("保存截图 (M)")
-        btn2.clicked.connect(self._screenshot)
-        tb.addWidget(btn2)
-
-        tb.addSeparator()
-        
-        # 相机选择（如果有加载的相机）
-        if self.camera.cameras_info and len(self.camera.cameras_info) > 0:
-            tb.addWidget(self._lbl(" 相机位姿:"))
-            self.camera_combo = QComboBox()
-            self.camera_combo.addItem("自由视角")
-            for i, cam in enumerate(self.camera.cameras_info):
-                self.camera_combo.addItem(f"{i+1}. {cam['name']}")
-            self.camera_combo.setMinimumWidth(120)
-            self.camera_combo.setToolTip("选择相机位姿 (N下一个 / P跳转最近)")
-            tb.addWidget(self.camera_combo)
-            tb.addSeparator()
-        else:
-            self.camera_combo = None
-        
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        tb.addWidget(spacer)
-
-        scene_badge = QLabel(self._scene_name())
-        scene_badge.setObjectName("SceneBadge")
-        tb.addWidget(scene_badge)
-
-    def _build_central(self):
+        # ── Central widget ──
         central = QWidget()
-        central.setObjectName("CentralShell")
+        central.setObjectName("CentralWidget")
         self.setCentralWidget(central)
-        vl = QVBoxLayout(central)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(0)
+        main_vl = QVBoxLayout(central)
+        main_vl.setContentsMargins(0, 0, 0, 0)
+        main_vl.setSpacing(0)
 
-        # 渲染视图
-        view_shell = QFrame()
-        view_shell.setObjectName("RenderShell")
-        view_layout = QVBoxLayout(view_shell)
-        view_layout.setContentsMargins(18, 18, 18, 10)
-        view_layout.setSpacing(10)
-        hint_row = QHBoxLayout()
-        hint_row.setContentsMargins(0, 0, 0, 0)
-        hint_row.addStretch()
-        hint = QLabel("Space 播放/暂停   G 显示模式   Esc 关闭   ←/→ 切帧")
-        hint.setObjectName("ShortcutHint")
-        hint_row.addWidget(hint)
-        view_layout.addLayout(hint_row)
+        # ── Middle section: left | viewport | right ──
+        middle = QWidget()
+        middle_hl = QHBoxLayout(middle)
+        middle_hl.setContentsMargins(0, 0, 0, 0)
+        middle_hl.setSpacing(0)
+
+        # Left panel
+        cameras_info = self.camera.cameras_info if hasattr(self.camera, 'cameras_info') else []
+        self.left_panel = LeftControlPanel(self.ui_state, cameras_info=cameras_info)
+        middle_hl.addWidget(self.left_panel)
+
+        # Left toggle button (visible when panel hidden)
+        self._left_toggle = QPushButton("▶")
+        self._left_toggle.setObjectName("TogglePanelBtn")
+        self._left_toggle.setToolTip("显示控制面板 (Tab)")
+        self._left_toggle.clicked.connect(lambda: self._set_left_panel_visible(True))
+        self._left_toggle.setVisible(False)
+        middle_hl.addWidget(self._left_toggle)
+
+        # Viewport
         self.view = RenderView()
         self.view.set_camera(self.camera)
         self.view.set_interaction_callback(self._request_render)
-        view_layout.addWidget(self.view, stretch=1)
-        vl.addWidget(view_shell, stretch=1)
+        middle_hl.addWidget(self.view, stretch=1)
 
-        # 底部控制栏
-        vl.addWidget(self._build_control_bar())
+        # Right toggle button (visible when panel hidden)
+        self._right_toggle = QPushButton("◀")
+        self._right_toggle.setObjectName("TogglePanelBtn")
+        self._right_toggle.setToolTip("显示信息面板 (Tab)")
+        self._right_toggle.clicked.connect(lambda: self._set_right_panel_visible(True))
+        self._right_toggle.setVisible(False)
+        middle_hl.addWidget(self._right_toggle)
 
-    def _build_control_bar(self) -> QFrame:
-        bar = QFrame()
-        bar.setObjectName("ControlBar")
-        bar.setFixedHeight(self.seq and 98 or 56)
-        vl = QVBoxLayout(bar)
-        vl.setContentsMargins(12, 6, 12, 6)
-        vl.setSpacing(4)
+        # Right panel
+        self.right_panel = RightInfoPanel(self.ui_state)
+        middle_hl.addWidget(self.right_panel)
 
-        if self.seq:
-            # 进度条行
-            seek_row = QHBoxLayout()
-            self.lbl_cur   = QLabel("1")
-            self.lbl_cur.setObjectName("FrameCounter")
-            self.lbl_cur.setFixedWidth(40)
-            self.seek      = QSlider(Qt.Horizontal)
-            self.seek.setRange(0, max(0, self.seq.num_frames - 1))
-            self.seek.setToolTip("拖动跳转帧位置")
-            self.lbl_total = QLabel(str(self.seq.num_frames))
-            self.lbl_total.setObjectName("SectionLabel")
-            self.lbl_total.setFixedWidth(50)
-            self.lbl_total.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            seek_row.addWidget(self.lbl_cur)
-            seek_row.addWidget(self.seek, stretch=1)
-            seek_row.addWidget(self.lbl_total)
-            vl.addLayout(seek_row)
+        main_vl.addWidget(middle, stretch=1)
 
-        # 按钮行
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(4)
+        # ── Bottom timeline ──
+        self.bottom_bar = BottomTimelineBar(
+            self.ui_state,
+            has_sequence=self.seq is not None,
+            num_frames=self.seq.num_frames if self.seq else 1,
+            playback_fps=self.seq.fps if self.seq else 30.0,
+        )
+        main_vl.addWidget(self.bottom_bar)
 
-        _BTN_STYLE = ""
+        # ── Viewport overlays ──
+        self.overlay = ViewportOverlay(self.view, self.ui_state)
+        self.view._overlay = self.overlay
 
-        if self.seq:
-            self.btn_first = self._ctrl_btn("⏮", "第一帧 (Home)", _BTN_STYLE)
-            self.btn_prev  = self._ctrl_btn("⏪", "上一帧 (←)",   _BTN_STYLE)
-            self.btn_play  = self._ctrl_btn("▶", "播放/暂停 (空格)", _BTN_STYLE, checkable=True)
-            self.btn_next  = self._ctrl_btn("⏩", "下一帧 (→)",   _BTN_STYLE)
-            self.btn_last  = self._ctrl_btn("⏭", "最后一帧 (End)", _BTN_STYLE)
+        self.toast = ToastNotification(self.view)
+        self.view._toast = self.toast
 
-            btn_row.addStretch()
-            for b in (self.btn_first, self.btn_prev, self.btn_play, self.btn_next, self.btn_last):
-                btn_row.addWidget(b)
-            btn_row.addSpacing(20)
-
-            # FPS 控制
-            btn_row.addWidget(self._lbl("播放 FPS:"))
-            self.fps_spin = QDoubleSpinBox()
-            self.fps_spin.setRange(0.1, 240.0)
-            self.fps_spin.setValue(self.seq.fps)
-            self.fps_spin.setSingleStep(1.0)
-            self.fps_spin.setDecimals(1)
-            self.fps_spin.setFixedWidth(70)
-            self.fps_spin.setToolTip("设置播放速度 (帧/秒)")
-            btn_row.addWidget(self.fps_spin)
-            btn_row.addSpacing(12)
-
-            # FPS 预设快速按钮
-            btn_row.addWidget(self._lbl("预设:"))
-            for fps_val in FPS_PRESETS:
-                fb = QPushButton(str(fps_val))
-                fb.setObjectName("ChipButton")
-                fb.setFixedSize(36, 28)
-                fb.setToolTip(f"设置 {fps_val} FPS")
-                fb.clicked.connect(lambda _, v=fps_val: self._set_fps_preset(v))
-                btn_row.addWidget(fb)
-
-        btn_row.addStretch()
-
-        # 状态信息
-        self.info_lbl = QLabel()
-        self.info_lbl.setObjectName("InfoLabel")
-        btn_row.addWidget(self.info_lbl)
-
-        vl.addLayout(btn_row)
-        return bar
-
-    def _build_statusbar(self):
+        # ── Status bar (minimal) ──
         status_bar = QStatusBar()
         status_bar.setObjectName("AppStatusBar")
+        status_bar.setStyleSheet(f"background: #0a1118; color: #5c7a94; border-top: 1px solid #1e3044; font-size: {F_CAPTION()}px;")
         self.setStatusBar(status_bar)
 
-    def _scene_name(self) -> str:
-        if self.seq:
-            return os.path.basename(os.path.abspath(self.seq.sequence_dir))
-        if getattr(self.pc, "ply_path", None):
-            return os.path.basename(self.pc.ply_path)
-        return "Scene"
+    def _sync_initial_state(self):
+        """Sync all UI widgets to initial state."""
+        self.top_bar.set_scene_name(self.ui_state.scene_name)
+        self.top_bar.sync_project_mode(self.ui_state.project_mode)
+        self.top_bar.sync_vis_mode(self.ui_state.vis_mode)
+        self.top_bar.sync_camera_mode(self.ui_state.camera_mode)
+        self.left_panel.sync_resolution(self.render_w, self.render_h)
+        self.left_panel.sync_point_size(self.ui_state.point_size)
+        self.overlay.sync_vis_mode(self.ui_state.vis_mode)
+        self.overlay.update_scene_label(
+            self.ui_state.scene_name, self.ui_state.vis_mode, self.ui_state.camera_mode
+        )
 
-    def _apply_window_theme(self):
-        self.setStyleSheet(PLAYER_QSS)
+    # ═══════════════════════════════════════════════════════════════════════
+    # Signal Connections
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _connect_signals(self):
+        # ── TopBar ──
+        self.top_bar.vis_mode_changed.connect(self._set_vis_mode)
+        self.top_bar.camera_mode_changed.connect(self._set_camera_mode)
+        self.top_bar.reset_clicked.connect(self._reset_camera)
+        self.top_bar.screenshot_clicked.connect(self._screenshot)
+        self.top_bar.fullscreen_clicked.connect(self._toggle_fullscreen)
+
+        # ── Left Panel ──
+        self.left_panel.resolution_changed.connect(self._set_render_res)
+        self.left_panel.background_changed.connect(self._on_bg_changed)
+        self.left_panel.point_size_changed.connect(self._on_point_size_changed)
+        self.left_panel.gamma_changed.connect(self._on_gamma_changed)
+        self.left_panel.exposure_changed.connect(self._on_exposure_changed)
+        self.left_panel.antialiasing_changed.connect(self._on_antialiasing_changed)
+        self.left_panel.splat_scale_changed.connect(self._on_splat_scale_changed)
+        self.left_panel.alpha_scale_changed.connect(self._on_alpha_scale_changed)
+        self.left_panel.show_centers_changed.connect(lambda v: self._on_gaussian_vis("centers", v))
+        self.left_panel.show_ellipsoids_changed.connect(lambda v: self._on_gaussian_vis("ellipsoids", v))
+        self.left_panel.show_pointcloud_changed.connect(lambda v: self._on_gaussian_vis("pointcloud", v))
+        self.left_panel.show_trails_changed.connect(lambda v: self._on_gaussian_vis("trails", v))
+        self.left_panel.camera_mode_changed.connect(self._set_camera_mode)
+        self.left_panel.camera_selected.connect(self._on_camera_selected)
+        self.left_panel.fov_changed.connect(self._on_fov_changed)
+        self.left_panel.reset_camera_clicked.connect(self._reset_camera)
+        self.left_panel.layer_changed.connect(self._on_layer_changed)
+        self.left_panel.debug_changed.connect(self._on_debug_changed)
+
+        # ── Bottom Bar ──
+        if self.seq:
+            self.bottom_bar.play_toggled.connect(self._on_play_toggled)
+            self.bottom_bar.first_frame.connect(lambda: (self.seq.set_frame(0), self._reload()))
+            self.bottom_bar.prev_frame.connect(lambda: (self.seq.prev_frame(), self._reload()))
+            self.bottom_bar.next_frame.connect(lambda: (self.seq.next_frame(), self._reload()))
+            self.bottom_bar.last_frame.connect(lambda: (self.seq.set_frame(self.seq.num_frames - 1), self._reload()))
+            self.bottom_bar.seek_moved.connect(self._on_seek_moved)
+            self.bottom_bar.seek_released.connect(self._on_seek_released)
+            self.bottom_bar.fps_changed.connect(lambda v: (self.seq.set_fps(v), self._request_render()))
+
+        # ── Viewport Overlay ──
+        self.overlay.quick_vis_mode_clicked.connect(self._set_vis_mode)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Shortcuts
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _register_shortcut(self, key, callback):
         sc = QShortcut(QKeySequence(key), self)
@@ -730,12 +544,14 @@ class MainWindow(QMainWindow):
             self._register_shortcut(Qt.Key_Minus, lambda: self._adj_fps(-5.0))
             self._register_shortcut(Qt.Key_Equal, lambda: self._adj_fps(+5.0))
             self._register_shortcut(Qt.Key_Plus, lambda: self._adj_fps(+5.0))
+
         self._register_shortcut(Qt.Key_Escape, self.close)
         self._register_shortcut(Qt.Key_F11, self._toggle_fullscreen)
-        self._register_shortcut(Qt.Key_G, self._cycle_display_mode)
+        self._register_shortcut(Qt.Key_F, self._toggle_fullscreen)
+        self._register_shortcut(Qt.Key_G, self._cycle_vis_mode)
         self._register_shortcut(Qt.Key_M, self._screenshot)
-        self._register_shortcut(Qt.Key_Y, self._shortcut_trackball)
-        self._register_shortcut(Qt.Key_B, self._shortcut_orbit)
+        self._register_shortcut(Qt.Key_Y, lambda: self._set_camera_mode("trackball"))
+        self._register_shortcut(Qt.Key_B, lambda: self._set_camera_mode("orbit"))
         self._register_shortcut(Qt.Key_1, lambda: self._shortcut_resolution(0))
         self._register_shortcut(Qt.Key_2, lambda: self._shortcut_resolution(1))
         self._register_shortcut(Qt.Key_3, lambda: self._shortcut_resolution(2))
@@ -743,86 +559,13 @@ class MainWindow(QMainWindow):
         self._register_shortcut(Qt.Key_N, self._next_camera)
         self._register_shortcut(Qt.Key_P, self._snap_to_nearest_camera)
         self._register_shortcut(Qt.Key_R, self._reset_camera)
+        self._register_shortcut(Qt.Key_Tab, self._toggle_panels)
+        self._register_shortcut(Qt.Key_H, self._toggle_hud)
+        self._register_shortcut("Ctrl+Return", self._toggle_presentation)
 
-    def _shortcut_trackball(self):
-        self.camera.switch_mode(InteractiveCamera.MODE_TRACKBALL)
-        self.mode_combo.setCurrentIndex(1)
-        self._request_render()
-
-    def _shortcut_orbit(self):
-        self.camera.switch_mode(InteractiveCamera.MODE_ORBIT)
-        self.mode_combo.setCurrentIndex(2)
-        self._request_render()
-
-    def _cycle_display_mode(self):
-        mode = self.renderer.cycle_render_mode()
-        for idx, (_label, option_mode) in enumerate(DISPLAY_MODE_OPTIONS):
-            if option_mode == mode:
-                self.display_combo.blockSignals(True)
-                self.display_combo.setCurrentIndex(idx)
-                self.display_combo.blockSignals(False)
-                break
-        self.statusBar().showMessage(f"显示模式: {self.renderer.get_render_mode_label()}", 2500)
-        self._request_render()
-
-    def _shortcut_resolution(self, idx: int):
-        if 0 <= idx < len(RESOLUTION_OPTIONS):
-            _, w, h = RESOLUTION_OPTIONS[idx]
-            self._set_render_res(w, h)
-            self.res_combo.blockSignals(True)
-            self.res_combo.setCurrentIndex(idx)
-            self.res_combo.blockSignals(False)
-
-    def _apply_initial_window_size(self):
-        screen = QApplication.primaryScreen()
-        if screen is None:
-            self.resize(1280, 860)
-            return
-
-        available = screen.availableGeometry()
-        chrome_w = 72
-        chrome_h = 238 if self.seq else 172
-        max_content_w = max(640, int(available.width() * 0.84) - chrome_w)
-        max_content_h = max(360, int(available.height() * 0.8) - chrome_h)
-        scale = min(
-            max_content_w / max(1, self.render_w),
-            max_content_h / max(1, self.render_h),
-            1.0,
-        )
-        content_w = max(720, int(self.render_w * scale))
-        content_h = max(405, int(self.render_h * scale))
-        window_w = min(available.width(), content_w + chrome_w)
-        window_h = min(available.height(), content_h + chrome_h)
-        self.resize(window_w, window_h)
-        self.move(
-            available.x() + max(0, (available.width() - window_w) // 2),
-            available.y() + max(0, (available.height() - window_h) // 2),
-        )
-
-    # ─── 信号连接 ─────────────────────────────────────────────────────────────
-
-    def _connect(self):
-        self.res_combo.currentIndexChanged.connect(self._on_res_changed)
-        self.bg_combo.currentIndexChanged.connect(self._on_bg_changed)
-        self.display_combo.currentIndexChanged.connect(self._on_display_mode_changed)
-        self.point_size_spin.valueChanged.connect(self._on_point_size_changed)
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        
-        if self.camera_combo:
-            self.camera_combo.currentIndexChanged.connect(self._on_camera_changed)
-
-        if self.seq:
-            self.btn_first.clicked.connect(lambda: (self.seq.set_frame(0), self._reload()))
-            self.btn_prev.clicked.connect(lambda: (self.seq.prev_frame(), self._reload()))
-            self.btn_play.toggled.connect(self._on_play_toggled)
-            self.btn_next.clicked.connect(lambda: (self.seq.next_frame(), self._reload()))
-            self.btn_last.clicked.connect(lambda: (self.seq.set_frame(self.seq.num_frames - 1), self._reload()))
-            self.seek.sliderPressed.connect(self._on_seek_pressed)
-            self.seek.sliderReleased.connect(self._on_seek_released)
-            self.seek.sliderMoved.connect(self._on_seek_moved)
-            self.fps_spin.valueChanged.connect(lambda v: (self.seq.set_fps(v), self._request_render()))
-
-    # ─── 渲染主循环 ───────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # Render Loop (核心逻辑不变)
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _request_render(self):
         self._needs_render = True
@@ -831,7 +574,7 @@ class MainWindow(QMainWindow):
         try:
             frame_updated = False
 
-            # 序列推进
+            # 序列推进 (不改动)
             if self.seq:
                 self.seq.service_prefetch()
                 if self.seq.playing:
@@ -857,8 +600,15 @@ class MainWindow(QMainWindow):
             if not (self._needs_render or frame_updated or self.view.is_interacting()):
                 return
 
-            # GPU 渲染
+            # GPU 渲染 (不改动)
             rendered = self.renderer.render(self.camera)
+
+            # Post-processing: gamma & exposure
+            if self.ui_state.exposure != 1.0:
+                rendered = rendered * self.ui_state.exposure
+            if self.ui_state.gamma != 1.0:
+                rendered = rendered.clamp(0, 1).pow(1.0 / self.ui_state.gamma)
+
             img = (
                 rendered.mul(255.0)
                 .clamp(0, 255)
@@ -882,47 +632,76 @@ class MainWindow(QMainWindow):
             self.pc.apply_frame(frame)
         self._request_render()
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # UI Update (每帧刷新各面板)
+    # ═══════════════════════════════════════════════════════════════════════
+
     def _update_ui(self):
-        now  = time.time()
-        dt   = max(now - self._last_t, 1e-6)
+        now = time.time()
+        dt = max(now - self._last_t, 1e-6)
         self._last_t = now
         self._fps_avg = 0.1 * (1.0 / dt) + 0.9 * self._fps_avg
+        self._update_counter += 1
 
-        r_str = f"{self.render_w}×{self.render_h}"
-        w_str = f"{self.view.width()}×{self.view.height()}"
-        parts = [f"渲染: {r_str}", f"窗口: {w_str}", f"Viewer FPS: {self._fps_avg:.1f}"]
-        parts.append(f"显示: {self.renderer.get_render_mode_label()}")
+        # Update state
+        self.ui_state.viewer_fps = self._fps_avg
+        self.ui_state.render_w = self.render_w
+        self.ui_state.render_h = self.render_h
+        self.ui_state.window_w = self.view.width()
+        self.ui_state.window_h = self.view.height()
+        self.ui_state.total_gaussians = self.pc.get_xyz.shape[0] if hasattr(self.pc, 'get_xyz') and self.pc.get_xyz is not None else 0
 
+        cache_str = ""
         if self.seq:
-            f = self.seq.current_frame + 1
-            t = self.seq.num_frames
-            state = "▶ 播放" if self.seq.playing else "⏸ 暂停"
-            parts += [f"帧: {f}/{t}", state, f"Playback: {self.seq.fps:.0f}fps"]
-
-            # 同步 UI 控件（避免循环信号）
-            if not self._seeking:
-                self.seek.blockSignals(True)
-                self.seek.setValue(self.seq.current_frame)
-                self.seek.blockSignals(False)
-            self.lbl_cur.setText(str(f))
-
-            self.btn_play.blockSignals(True)
-            playing = self.seq.playing
-            self.btn_play.setChecked(playing)
-            self.btn_play.setText("⏸" if playing else "▶")
-            self.btn_play.blockSignals(False)
-
+            self.ui_state.current_frame = self.seq.current_frame + 1
+            self.ui_state.total_frames = self.seq.num_frames
+            self.ui_state.is_playing = self.seq.playing
+            self.ui_state.playback_fps = self.seq.fps
+            cache_str = self.seq.get_cache_status()
+            self.ui_state.cache_status = cache_str
             stats = self.seq.get_load_stats()
             if stats['total_accesses'] > 0:
-                parts.append(f"缓存命中: {stats['hit_rate']:.0f}%")
-            parts.append(self.seq.get_cache_status())
+                self.ui_state.cache_hit_rate = stats['hit_rate']
 
-        self.info_lbl.setText("  |  ".join(parts))
+        # GPU memory (not every frame - every 30 frames)
+        if self._update_counter % 30 == 0 and torch.cuda.is_available():
+            try:
+                mem_used = torch.cuda.memory_allocated() / (1024**2)
+                mem_total = torch.cuda.get_device_properties(0).total_mem / (1024**2)
+                self.ui_state.gpu_memory_used = f"{mem_used:.0f}MB"
+                self.ui_state.gpu_memory_total = f"{mem_total:.0f}MB"
+            except Exception:
+                pass
+
+        # Update bottom bar
+        if self.seq:
+            self.bottom_bar.update_playback(
+                self.seq.current_frame, self.seq.num_frames,
+                self.seq.playing, self.seq.fps, cache_str
+            )
+
+        # Update overlay HUD
+        frame_str = f"Frame {self.ui_state.current_frame}/{self.ui_state.total_frames}" if self.seq else "Static"
+        cache_label = f"Cache: {cache_str}" if cache_str else ""
+        self.overlay.update_hud(self._fps_avg, frame_str, cache_label)
+
+        # Update right panel (throttled to every 5 frames for performance)
+        if self._update_counter % 5 == 0:
+            extra = {
+                "io_status": f"×{_recommended_io_workers()}",
+                "preload_status": "完成" if (self.seq and not self.seq.playing) else "—",
+                "last_event": self._last_event or "—",
+            }
+            self.right_panel.update_info(self.ui_state, extra)
+
+        # Status bar (minimal)
         self.statusBar().showMessage(
-            f"渲染: {r_str}  窗口: {w_str}  FPS: {self._fps_avg:.1f}"
+            f"{self.render_w}×{self.render_h}  FPS: {self._fps_avg:.0f}"
         )
 
-    # ─── 键盘处理 ─────────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # Keyboard handling (不改动)
+    # ═══════════════════════════════════════════════════════════════════════
 
     def keyPressEvent(self, e):
         k = e.key()
@@ -961,101 +740,154 @@ class MainWindow(QMainWindow):
         if moved:
             self._request_render()
 
-    # ─── 控件事件槽 ───────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # Actions — Visualization Mode
+    # ═══════════════════════════════════════════════════════════════════════
 
-    def _on_res_changed(self, idx):
-        if 0 <= idx < len(RESOLUTION_OPTIONS):
-            _, w, h = RESOLUTION_OPTIONS[idx]
-            self._set_render_res(w, h)
+    def _set_vis_mode(self, mode_key: str):
+        """Set visualization mode (may change renderer mode or show placeholder)."""
+        render_mode = _vis_to_render_mode(mode_key)
+        if render_mode is not None:
+            self.renderer.set_render_mode(render_mode)
+            self.ui_state.vis_mode = mode_key
+            self.top_bar.sync_vis_mode(mode_key)
+            self.left_panel.sync_camera_mode(self.ui_state.camera_mode)
+            self.overlay.sync_vis_mode(mode_key)
+            vis_label = dict((k, l) for l, k in VISUALIZATION_MODES).get(mode_key, mode_key)
+            self._set_last_event(f"显示: {vis_label}")
+            self.toast.show_message(f"显示模式: {vis_label}", 1500)
+        else:
+            # Placeholder mode not yet implemented
+            vis_label = dict((k, l) for l, k in VISUALIZATION_MODES).get(mode_key, mode_key)
+            self.toast.show_message(f"{vis_label} 模式即将支持", 2000)
+        self._update_overlay_scene()
+        self._request_render()
+
+    def _cycle_vis_mode(self):
+        """Cycle through implemented visualization modes (G key)."""
+        implemented = [k for k in ["rgb", "gaussian", "ring"] if k in VIS_TO_RENDER_MODE]
+        if not implemented:
+            return
+        try:
+            idx = implemented.index(self.ui_state.vis_mode)
+            next_idx = (idx + 1) % len(implemented)
+        except ValueError:
+            next_idx = 0
+        self._set_vis_mode(implemented[next_idx])
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Actions — Camera Mode
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _set_camera_mode(self, mode_key: str):
+        cam_mode = CAMERA_KEY_TO_MODE.get(mode_key)
+        if cam_mode is not None:
+            self.camera.switch_mode(cam_mode)
+            self.ui_state.camera_mode = mode_key
+            self.top_bar.sync_camera_mode(mode_key)
+            self.left_panel.sync_camera_mode(mode_key)
+            cam_label = dict((k, l) for l, k in CAMERA_MODES).get(mode_key, mode_key)
+            self._set_last_event(f"相机: {cam_label}")
+            self._update_overlay_scene()
+            self._request_render()
+
+    def _on_camera_selected(self, idx: int):
+        """Camera pose selection from left panel."""
+        if idx == 0:
+            self.camera.current_camera_idx = -1
+        else:
+            camera_idx = idx - 1
+            self.camera.set_camera(camera_idx)
+        self._request_render()
+
+    def _next_camera(self):
+        if self.camera.cameras_info and len(self.camera.cameras_info) > 0:
+            self.camera.next_camera()
+            self.left_panel.sync_camera_pose(self.camera.current_camera_idx)
+            self._request_render()
+
+    def _snap_to_nearest_camera(self):
+        if self.camera.cameras_info and len(self.camera.cameras_info) > 0:
+            self.camera.snap_to_nearest_camera()
+            self.left_panel.sync_camera_pose(self.camera.current_camera_idx)
+            self._request_render()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Actions — Resolution & Display
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _set_render_res(self, w: int, h: int):
         self.render_w = w
         self.render_h = h
         self.camera.resize(w, h)
-        # 同步 combo（不触发信号）
-        for i, (_, rw, rh) in enumerate(RESOLUTION_OPTIONS):
-            if rw == w and rh == h:
-                self.res_combo.blockSignals(True)
-                self.res_combo.setCurrentIndex(i)
-                self.res_combo.blockSignals(False)
-                break
-        # 清空 means2D 缓存
         self.renderer._means2d_buffer = None
-        self.statusBar().showMessage(f"渲染分辨率: {w}×{h}", 3000)
+        self.left_panel.sync_resolution(w, h)
+        self._set_last_event(f"分辨率: {w}×{h}")
+        self.toast.show_message(f"渲染分辨率: {w}×{h}", 1500)
         self._request_render()
 
-    def _sync_resolution_combo(self):
-        for i, (_, w, h) in enumerate(RESOLUTION_OPTIONS):
-            if w == self.render_w and h == self.render_h:
-                self.res_combo.setCurrentIndex(i)
-                return
-        self.res_combo.setCurrentIndex(0)
+    def _shortcut_resolution(self, idx: int):
+        if 0 <= idx < len(RESOLUTION_OPTIONS):
+            _, w, h = RESOLUTION_OPTIONS[idx]
+            self._set_render_res(w, h)
 
-    def _sync_display_mode_combo(self):
-        current_mode = getattr(self.renderer, "render_mode", GaussianRenderer.RENDER_MODE_SPLAT)
-        for idx, (_label, mode) in enumerate(DISPLAY_MODE_OPTIONS):
-            if mode == current_mode:
-                self.display_combo.blockSignals(True)
-                self.display_combo.setCurrentIndex(idx)
-                self.display_combo.blockSignals(False)
-                return
-        self.display_combo.setCurrentIndex(0)
-
-    def _on_bg_changed(self, idx):
+    def _on_bg_changed(self, idx: int):
         color = [1.0, 1.0, 1.0] if idx else [0.0, 0.0, 0.0]
         self.renderer.set_background_color(color)
         self._request_render()
 
-    def _on_display_mode_changed(self, idx):
-        if 0 <= idx < len(DISPLAY_MODE_OPTIONS):
-            _label, mode = DISPLAY_MODE_OPTIONS[idx]
-            self.renderer.set_render_mode(mode)
-            self.statusBar().showMessage(f"显示模式: {self.renderer.get_render_mode_label()}", 2500)
-            self._request_render()
-
-    def _on_point_size_changed(self, value):
+    def _on_point_size_changed(self, value: float):
         self.renderer.set_point_style(size=value)
+        self.ui_state.point_size = value
         self._request_render()
 
-    def _on_mode_changed(self, idx):
-        modes = [InteractiveCamera.MODE_FPS, InteractiveCamera.MODE_TRACKBALL, InteractiveCamera.MODE_ORBIT]
-        if 0 <= idx < len(modes):
-            self.camera.mode = modes[idx]
-            self._request_render()
-    
-    def _on_camera_changed(self, idx):
-        """相机选择下拉框回调"""
-        if idx == 0:
-            # 自由视角 - 重置相机
-            self.camera.current_camera_idx = -1
-        else:
-            # 切换到指定相机
-            camera_idx = idx - 1
-            if self.camera.set_camera(camera_idx):
-                pass
+    def _on_gamma_changed(self, value: float):
+        self.ui_state.gamma = value
         self._request_render()
-    
-    def _next_camera(self):
-        """切换到下一个相机 (N键)"""
-        if self.camera.cameras_info and len(self.camera.cameras_info) > 0:
-            self.camera.next_camera()
-            # 同步下拉框
-            if self.camera_combo:
-                self.camera_combo.blockSignals(True)
-                self.camera_combo.setCurrentIndex(self.camera.current_camera_idx + 1)
-                self.camera_combo.blockSignals(False)
-            self._request_render()
-    
-    def _snap_to_nearest_camera(self):
-        """跳转到最近的相机 (P键)"""
-        if self.camera.cameras_info and len(self.camera.cameras_info) > 0:
-            self.camera.snap_to_nearest_camera()
-            # 同步下拉框
-            if self.camera_combo:
-                self.camera_combo.blockSignals(True)
-                self.camera_combo.setCurrentIndex(self.camera.current_camera_idx + 1)
-                self.camera_combo.blockSignals(False)
-            self._request_render()
+
+    def _on_exposure_changed(self, value: float):
+        self.ui_state.exposure = value
+        self._request_render()
+
+    def _on_antialiasing_changed(self, enabled: bool):
+        self.ui_state.antialiasing = enabled
+        self._request_render()
+
+    def _on_splat_scale_changed(self, value: float):
+        self.ui_state.splat_scale = value
+        self._request_render()
+
+    def _on_alpha_scale_changed(self, value: float):
+        self.ui_state.alpha_scale = value
+        # Map alpha_scale to renderer point_opacity
+        self.renderer.set_point_style(opacity=min(1.0, max(0.05, value)))
+        self._request_render()
+
+    def _on_fov_changed(self, value_deg: float):
+        import math
+        self.camera.FoVx = math.radians(value_deg)
+        # Recalculate FoVy from aspect ratio
+        aspect = self.camera.width / max(1, self.camera.height)
+        self.camera.FoVy = 2 * math.atan(math.tan(self.camera.FoVx / 2) / aspect)
+        self._set_last_event(f"FOV: {value_deg:.0f}°")
+        self._request_render()
+
+    def _on_gaussian_vis(self, key: str, enabled: bool):
+        """Handle Gaussian visualization toggles — map to render mode if applicable."""
+        if key == "pointcloud" and enabled:
+            self.renderer.set_render_mode(GaussianRenderer.RENDER_MODE_POINTS)
+            self.ui_state.vis_mode = "gaussian"
+            self.top_bar.sync_vis_mode("gaussian")
+        elif key == "centers" and enabled:
+            self.renderer.set_render_mode(GaussianRenderer.RENDER_MODE_RING)
+            self.ui_state.vis_mode = "ring"
+            self.top_bar.sync_vis_mode("ring")
+        self._set_last_event(f"高斯显示 {key}: {'ON' if enabled else 'OFF'}")
+        self._request_render()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Actions — Playback
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _on_play_toggled(self, checked: bool):
         if self.seq:
@@ -1066,43 +898,68 @@ class MainWindow(QMainWindow):
     def _toggle_play(self):
         if self.seq:
             self.seq.toggle_play()
-            self.btn_play.blockSignals(True)
-            self.btn_play.setChecked(self.seq.playing)
-            self.btn_play.setText("⏸" if self.seq.playing else "▶")
-            self.btn_play.blockSignals(False)
             self._reload()
 
-    def _on_seek_pressed(self):
-        self._seeking = True
-
     def _on_seek_moved(self, value: int):
-        if not self.seq:
-            return
-        self.lbl_cur.setText(str(value + 1))
-        self.seq.set_frame(value)
-        self.seq.request_frame(value, prefer_device=self._preferred_frame_device)
-
-    def _on_seek_released(self):
-        self._seeking = False
         if self.seq:
-            self.seq.set_frame(self.seek.value())
+            self.seq.set_frame(value)
+            self.seq.request_frame(value, prefer_device=self._preferred_frame_device)
+
+    def _on_seek_released(self, value: int):
+        if self.seq:
+            self.seq.set_frame(value)
             self._reload()
 
     def _adj_fps(self, delta: float):
         if self.seq:
             new_fps = self.seq.adjust_fps(delta)
-            self.fps_spin.blockSignals(True)
-            self.fps_spin.setValue(new_fps)
-            self.fps_spin.blockSignals(False)
+            self.bottom_bar.sync_fps(new_fps)
             self._request_render()
 
-    def _set_fps_preset(self, fps_val: int):
-        if self.seq:
-            self.seq.set_fps(fps_val)
-            self.fps_spin.blockSignals(True)
-            self.fps_spin.setValue(fps_val)
-            self.fps_spin.blockSignals(False)
-            self._request_render()
+    # ═══════════════════════════════════════════════════════════════════════
+    # Actions — Panel & HUD toggling
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _toggle_panels(self):
+        """Toggle both left and right panels."""
+        both_visible = self.left_panel.isVisible() and self.right_panel.isVisible()
+        self._set_left_panel_visible(not both_visible)
+        self._set_right_panel_visible(not both_visible)
+
+    def _set_left_panel_visible(self, visible: bool):
+        self.left_panel.setVisible(visible)
+        self._left_toggle.setVisible(not visible)
+        self.ui_state.left_panel_visible = visible
+
+    def _set_right_panel_visible(self, visible: bool):
+        self.right_panel.setVisible(visible)
+        self._right_toggle.setVisible(not visible)
+        self.ui_state.right_panel_visible = visible
+
+    def _toggle_hud(self):
+        self.ui_state.hud_visible = not self.ui_state.hud_visible
+        self.overlay.set_hud_visible(self.ui_state.hud_visible)
+
+    def _toggle_presentation(self):
+        """Presentation mode: hide panels, minimize chrome, viewport + timeline + HUD only."""
+        self.ui_state.presentation_mode = not self.ui_state.presentation_mode
+        pres = self.ui_state.presentation_mode
+
+        self._set_left_panel_visible(not pres)
+        self._set_right_panel_visible(not pres)
+        self.top_bar.setVisible(not pres)
+        self.menuBar().setVisible(not pres)
+        self.overlay.set_shortcuts_visible(not pres)
+
+        if pres:
+            self.toast.show_message("演示模式 — Ctrl+Enter 退出", 2000)
+            self._set_last_event("进入演示模式")
+        else:
+            self._set_last_event("退出演示模式")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Actions — Global
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1113,10 +970,11 @@ class MainWindow(QMainWindow):
 
     def _reset_camera(self):
         self.camera.reset()
+        self._set_last_event("相机已重置")
+        self.toast.show_message("相机已重置", 1500)
         self._request_render()
 
     def _screenshot(self):
-        # 渲染到高分辨率（原始渲染大小）并保存
         rendered = self.renderer.render(self.camera)
         img = rendered.permute(1, 2, 0).cpu().numpy()
         img = (img * 255).astype(np.uint8).copy()
@@ -1126,49 +984,108 @@ class MainWindow(QMainWindow):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"screenshot_{ts}.png"
         pixmap.save(fname)
-        self.statusBar().showMessage(f"截图已保存: {fname}  ({w}×{h})", 4000)
+        self._set_last_event(f"截图: {fname}")
+        self.toast.show_message(f"截图已保存: {fname} ({w}×{h})", 3000)
         print(f"截图已保存: {fname}  ({w}×{h})")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Actions — 4DGS Layer & Debug (placeholder hooks)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _on_layer_changed(self, key: str, enabled: bool):
+        """TODO: Connect to rendering pipeline layer filtering when available."""
+        setattr(self.ui_state, f"layer_{key}" if hasattr(self.ui_state, f"layer_{key}") else key, enabled)
+        self._set_last_event(f"图层 {key}: {'ON' if enabled else 'OFF'}")
+
+    def _on_debug_changed(self, key: str, enabled: bool):
+        """TODO: Connect to debug overlay rendering when available."""
+        mapping = {
+            "active_set": "show_active_set",
+            "visible_gauss": "show_visible_gaussians",
+            "cache_region": "show_cache_region",
+            "window_interval": "show_window_interval",
+            "diagnostics": "show_diagnostics",
+            "bounding_boxes": "show_bounding_boxes",
+        }
+        attr = mapping.get(key)
+        if attr:
+            setattr(self.ui_state, attr, enabled)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Helpers
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _scene_name(self) -> str:
+        if self.seq:
+            return os.path.basename(os.path.abspath(self.seq.sequence_dir))
+        if getattr(self.pc, "ply_path", None):
+            return os.path.basename(self.pc.ply_path)
+        return "Scene"
+
+    def _set_last_event(self, text: str):
+        self._last_event = text
+
+    def _update_overlay_scene(self):
+        cam_label = dict((k, l) for l, k in CAMERA_MODES).get(self.ui_state.camera_mode, "Free")
+        self.overlay.update_scene_label(
+            self.ui_state.scene_name, self.ui_state.vis_mode, cam_label
+        )
+
+    def _apply_initial_window_size(self):
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1440, 900)
+            return
+
+        available = screen.availableGeometry()
+        chrome_w = 72 + 260 + 280  # panels
+        chrome_h = 200
+        max_content_w = max(640, int(available.width() * 0.88) - chrome_w)
+        max_content_h = max(360, int(available.height() * 0.85) - chrome_h)
+        scale = min(
+            max_content_w / max(1, self.render_w),
+            max_content_h / max(1, self.render_h),
+            1.0,
+        )
+        content_w = max(720, int(self.render_w * scale))
+        content_h = max(405, int(self.render_h * scale))
+        window_w = min(available.width(), content_w + chrome_w)
+        window_h = min(available.height(), content_h + chrome_h)
+        self.resize(window_w, window_h)
+        self.move(
+            available.x() + max(0, (available.width() - window_w) // 2),
+            available.y() + max(0, (available.height() - window_h) // 2),
+        )
 
     def _show_help(self):
         QMessageBox.information(self, "快捷键帮助", """
 <b>分辨率控制</b><br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>1/2/3/4</b> — 720p / 1080p / 2K / 4K<br>
-&nbsp;&nbsp;&nbsp;&nbsp;工具栏下拉菜单 — 任意预设<br>
-&nbsp;&nbsp;&nbsp;&nbsp;窗口边框可自由拖动，不影响渲染分辨率<br><br>
+&nbsp;&nbsp;<b>1/2/3/4</b> — 720p / 1080p / 2K / 4K<br><br>
 
 <b>显示模式</b><br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>G</b> — 高斯 / 点模式 循环切换<br>
-&nbsp;&nbsp;&nbsp;&nbsp;工具栏显示下拉框 — 直接切换显示方式<br>
-&nbsp;&nbsp;&nbsp;&nbsp;工具栏点大小 — 调整点模式下的高斯尺寸倍率<br><br>
+&nbsp;&nbsp;<b>G</b> — 循环切换 (RGB / Gaussian / Ring)<br><br>
 
-<b>相机移动 (FPS 模式)</b><br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>W/S</b> — 前进 / 后退 &nbsp; <b>A/D</b> — 左移 / 右移 &nbsp; <b>Q/E</b> — 下 / 上<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>I/K</b> — 俯仰 &nbsp; <b>J/L</b> — 偏航 &nbsp; <b>U/O</b> — 滚转<br>
-&nbsp;&nbsp;&nbsp;&nbsp;鼠标左键拖动 — 横向平移<br>
-&nbsp;&nbsp;&nbsp;&nbsp;鼠标右键拖动 — 纵向平移<br>
-&nbsp;&nbsp;&nbsp;&nbsp;鼠标中键拖动 / 滚轮 — 缩放<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>Y</b> — Trackball 模式 &nbsp; <b>B</b> — Orbit 模式<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>R</b> — 重置相机到初始位置<br><br>
+<b>相机移动</b><br>
+&nbsp;&nbsp;<b>W/S</b> 前后 &nbsp; <b>A/D</b> 左右 &nbsp; <b>Q/E</b> 上下<br>
+&nbsp;&nbsp;<b>I/K</b> 俯仰 &nbsp; <b>J/L</b> 偏航 &nbsp; <b>U/O</b> 滚转<br>
+&nbsp;&nbsp;<b>Y</b> Trackball &nbsp; <b>B</b> Orbit &nbsp; <b>R</b> 重置相机<br>
+&nbsp;&nbsp;<b>N</b> 下一相机 &nbsp; <b>P</b> 跳转最近相机<br><br>
 
-<b>真实相机位姿切换</b><br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>N</b> — 下一个相机位姿<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>P</b> — 跳转到最近的相机位姿<br>
-&nbsp;&nbsp;&nbsp;&nbsp;工具栏下拉菜单 — 直接选择特定相机<br>
-&nbsp;&nbsp;&nbsp;&nbsp;使用 --sparse 参数加载 COLMAP 数据<br><br>
+<b>播放</b><br>
+&nbsp;&nbsp;<b>Space</b> 播放/暂停 &nbsp; <b>←/→</b> 逐帧 &nbsp; <b>Home/End</b> 首/尾帧<br>
+&nbsp;&nbsp;<b>-/+</b> 调整 FPS ±5<br><br>
 
-<b>序列播放</b><br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>空格</b> — 播放 / 暂停<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>← →</b> — 上 / 下一帧 &nbsp; <b>Home/End</b> — 第一 / 最后一帧<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>- +</b> — 调整播放 FPS ±5<br>
-&nbsp;&nbsp;&nbsp;&nbsp;底部 FPS 数字框 / 预设按钮 — 直接设定<br><br>
+<b>界面</b><br>
+&nbsp;&nbsp;<b>Tab</b> 隐藏/显示侧栏 &nbsp; <b>H</b> 隐藏/显示 HUD<br>
+&nbsp;&nbsp;<b>Ctrl+Enter</b> 演示模式 &nbsp; <b>F/F11</b> 全屏<br><br>
 
 <b>其他</b><br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>M</b> — 截图（保存原始渲染分辨率）<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>F11</b> — 全屏<br>
-&nbsp;&nbsp;&nbsp;&nbsp;<b>Esc</b> — 退出
+&nbsp;&nbsp;<b>M</b> 截图 &nbsp; <b>Esc</b> 退出
 """)
 
-    # ─── 生命周期 ─────────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # Lifecycle
+    # ═══════════════════════════════════════════════════════════════════════
 
     def closeEvent(self, event):
         self._render_timer.stop()
@@ -1177,29 +1094,9 @@ class MainWindow(QMainWindow):
             self.seq.shutdown()
         event.accept()
 
-    # ─── 工具函数 ─────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _lbl(text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setObjectName("SectionLabel")
-        return lbl
-
-    @staticmethod
-    def _ctrl_btn(text, tip, style, checkable=False) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setObjectName("TransportButton")
-        btn.setToolTip(tip)
-        btn.setFixedSize(36, 36)
-        if style:
-            btn.setStyleSheet(style)
-        if checkable:
-            btn.setCheckable(True)
-        return btn
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 构建播放器对象
+# 构建播放器对象 (不改动核心逻辑)
 # ═══════════════════════════════════════════════════════════════════════════════
 def _build_objects(args):
     ply_path       = None
@@ -1218,7 +1115,6 @@ def _build_objects(args):
                 sequence_dir = input_path
                 ply_path     = os.path.join(input_path, ply_files[0])
             else:
-                # 兼容上层目录输入：自动探测常见帧目录
                 nested_candidates = []
                 for rel in ("per_frame_ply", "global_per_frame_ply"):
                     cand = os.path.join(input_path, rel)
@@ -1286,9 +1182,8 @@ def _build_objects(args):
     # 加载相机
     data_path = getattr(args, 'path', None)
     sparse_path = getattr(args, 'sparse', None)
-    
+
     if sparse_path and os.path.isdir(sparse_path):
-        # 从 COLMAP sparse 数据加载
         cameras = _core.load_cameras_from_colmap(sparse_path)
     elif data_path:
         cameras_json = os.path.join(data_path, "cameras.json")
@@ -1351,51 +1246,45 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 序列播放（自动流式加载）
   python player.py data/1/window_000/per_frame_ply
-
-  # 4K 渲染，30fps
   python player.py data/1/window_000/per_frame_ply --render-resolution 4k --playback-fps 30
-
-  # 大序列，增大缓存
   python player.py data/1/window_000/per_frame_ply --gpu-cache-size 6 --cpu-cache-size 16
-
-  # 单帧 PLY
   python player.py model/point_cloud/iteration_30000/point_cloud.ply --render-resolution 2k
-  
-  # 加载 COLMAP 真实相机位姿（可用 N/P 键切换）
   python player.py data/sequence --sparse data/sparse
-  python player.py output/scene/point_cloud.ply --sparse colmap/sparse/0
 """,
     )
     parser.add_argument("input",              nargs="?", default=None,   help="PLY 文件或序列目录")
     parser.add_argument("--model-path","-m",  default=None, dest="model_path")
     parser.add_argument("--path","-s",        default=None,              help="cameras.json 所在目录")
-    parser.add_argument("--sparse",           default=None,              help="COLMAP sparse 重建目录 (包含 cameras.bin/txt 和 images.bin/txt)")
+    parser.add_argument("--sparse",           default=None,              help="COLMAP sparse 重建目录")
     parser.add_argument("--ply_path",         default=None)
-    parser.add_argument("--render-resolution",default="1080p",           help="渲染分辨率: 720p/1080p/2k/4k/WxH  [默认: 1080p]")
-    parser.add_argument("--playback-fps",     type=float, default=30.0,  help="播放帧率 [默认: 30]")
+    parser.add_argument("--render-resolution",default="1080p",           help="渲染分辨率: 720p/1080p/2k/4k/WxH")
+    parser.add_argument("--playback-fps",     type=float, default=30.0,  help="播放帧率")
     parser.add_argument("--sh_degree",        type=int,   default=None)
     parser.add_argument("--load-mode",        default=SequenceManager.LOAD_MODE_AUTO,
                         choices=[SequenceManager.LOAD_MODE_AUTO,
                                  SequenceManager.LOAD_MODE_STREAM,
                                  SequenceManager.LOAD_MODE_PRELOAD_CPU,
                                  SequenceManager.LOAD_MODE_PRELOAD_GPU])
-    parser.add_argument("--gpu-cache-size",   type=int, default=10, help="GPU 缓存帧数 (适合小规模场景，减少加载卡顿)")
-    parser.add_argument("--cpu-cache-size",   type=int, default=30, help="CPU 缓存帧数 (适合大规模场景，减少加载卡顿)")
-    parser.add_argument("--prefetch-count",   type=int, default=30, help="预取帧数 (适合大规模场景，减少加载卡顿)")
-    parser.add_argument("--io-workers",       type=int, default=24, help="后台IO线程数 [默认: 自动 4-8]")
-    parser.add_argument("--max-gaussians",    type=int, default=None,    help="每帧最多高斯点数（适合预览大规模场景）")
+    parser.add_argument("--gpu-cache-size",   type=int, default=10)
+    parser.add_argument("--cpu-cache-size",   type=int, default=30)
+    parser.add_argument("--prefetch-count",   type=int, default=30)
+    parser.add_argument("--io-workers",       type=int, default=24)
+    parser.add_argument("--max-gaussians",    type=int, default=None)
     parser.add_argument("--no-pin-memory",    action="store_true")
     parser.add_argument("--white_background","-w", action="store_true")
     parser.add_argument(
         "--display-mode",
         default=GaussianRenderer.RENDER_MODE_SPLAT,
-        choices=[mode for _label, mode in DISPLAY_MODE_OPTIONS],
-        help="显示模式: splat / points [默认: splat]",
+        choices=[mode for _label, mode in [
+            ("splat", GaussianRenderer.RENDER_MODE_SPLAT),
+            ("points", GaussianRenderer.RENDER_MODE_POINTS),
+            ("ring", GaussianRenderer.RENDER_MODE_RING),
+        ]],
+        help="显示模式",
     )
-    parser.add_argument("--point-size", type=float, default=1.0, help="点模式下的高斯尺寸倍率 [默认: 1.0]")
-    parser.add_argument("--point-opacity", type=float, default=1.0, help="点模式下的全局不透明度倍率 [默认: 1.0]")
+    parser.add_argument("--point-size",    type=float, default=1.0)
+    parser.add_argument("--point-opacity", type=float, default=1.0)
 
     args = parser.parse_args()
 
@@ -1405,19 +1294,19 @@ def main():
         sys.exit(1)
 
     app = QApplication(sys.argv)
-    app.setApplicationName("4DGS Interactive Player")
+    app.setApplicationName("4DGS Viewer")
 
     # Fusion 暗色主题
     app.setStyle("Fusion")
     pal = QPalette()
-    pal.setColor(QPalette.Window,          QColor(40,  40,  40))
-    pal.setColor(QPalette.WindowText,      QColor(220, 220, 220))
-    pal.setColor(QPalette.Base,            QColor(25,  25,  25))
-    pal.setColor(QPalette.AlternateBase,   QColor(50,  50,  50))
-    pal.setColor(QPalette.Text,            QColor(220, 220, 220))
-    pal.setColor(QPalette.Button,          QColor(55,  55,  55))
-    pal.setColor(QPalette.ButtonText,      QColor(220, 220, 220))
-    pal.setColor(QPalette.Highlight,       QColor(58,  123, 213))
+    pal.setColor(QPalette.Window,          QColor(10,  17,  24))
+    pal.setColor(QPalette.WindowText,      QColor(232, 240, 248))
+    pal.setColor(QPalette.Base,            QColor(10,  17,  24))
+    pal.setColor(QPalette.AlternateBase,   QColor(15,  25,  35))
+    pal.setColor(QPalette.Text,            QColor(232, 240, 248))
+    pal.setColor(QPalette.Button,          QColor(19,  31,  44))
+    pal.setColor(QPalette.ButtonText,      QColor(232, 240, 248))
+    pal.setColor(QPalette.Highlight,       QColor(43,  125, 233))
     pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
     app.setPalette(pal)
 
