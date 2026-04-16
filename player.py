@@ -95,6 +95,7 @@ FPS_PRESETS = [10, 15, 24, 30, 60, 120]
 DISPLAY_MODE_OPTIONS = [
     ("高斯", GaussianRenderer.RENDER_MODE_SPLAT),
     ("点模式", GaussianRenderer.RENDER_MODE_POINTS),
+    ("Ring模式", GaussianRenderer.RENDER_MODE_RING),
 ]
 
 

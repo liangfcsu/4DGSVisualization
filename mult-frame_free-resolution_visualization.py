@@ -2618,9 +2618,11 @@ class GaussianRenderer:
 
     RENDER_MODE_SPLAT = "splat"
     RENDER_MODE_POINTS = "points"
+    RENDER_MODE_RING = "ring"
     RENDER_MODE_LABELS = {
         RENDER_MODE_SPLAT: "高斯",
         RENDER_MODE_POINTS: "高斯点",
+        RENDER_MODE_RING: "Ring模式",
     }
     
     def __init__(self, pc, bg_color=[0, 0, 0]):
@@ -2658,6 +2660,7 @@ class GaussianRenderer:
         modes = [
             self.RENDER_MODE_SPLAT,
             self.RENDER_MODE_POINTS,
+            self.RENDER_MODE_RING,
         ]
         next_idx = (modes.index(self.render_mode) + 1) % len(modes)
         self.render_mode = modes[next_idx]
@@ -2699,21 +2702,29 @@ class GaussianRenderer:
             screenspace_points = self._get_screenspace_buffer()
             bg = self._background_color(screenspace_points.device)
             
-            raster_settings = GaussianRasterizationSettings(
-                image_height=image_height,
-                image_width=image_width,
-                tanfovx=math.tan(cam.FoVx * 0.5),
-                tanfovy=math.tan(cam.FoVy * 0.5),
-                bg=bg,
-                scale_modifier=1.0,
-                viewmatrix=cam.world_view_transform,
-                projmatrix=cam.full_proj_transform,
-                sh_degree=self.pc.active_sh_degree,
-                campos=cam.camera_center,
-                prefiltered=False,
-                debug=False,
-                antialiasing=False
-            )
+            kwargs = {
+                'image_height': image_height,
+                'image_width': image_width,
+                'tanfovx': math.tan(cam.FoVx * 0.5),
+                'tanfovy': math.tan(cam.FoVy * 0.5),
+                'bg': bg,
+                'scale_modifier': 1.0,
+                'viewmatrix': cam.world_view_transform,
+                'projmatrix': cam.full_proj_transform,
+                'sh_degree': self.pc.active_sh_degree,
+                'campos': cam.camera_center,
+                'prefiltered': False,
+                'debug': False,
+            }
+            if hasattr(GaussianRasterizationSettings, '_fields'):
+                if 'antialiasing' in GaussianRasterizationSettings._fields:
+                    kwargs['antialiasing'] = False
+                if 'ring_mode' in GaussianRasterizationSettings._fields:
+                    kwargs['ring_mode'] = (self.render_mode == self.RENDER_MODE_RING)
+                elif self.render_mode == self.RENDER_MODE_RING:
+                    print("WARN: 您的 diff-gaussian-rasterization 版本不支持 ring_mode 物理空心环渲染，需重新编译 CUDA 插件。")
+            
+            raster_settings = GaussianRasterizationSettings(**kwargs)
             
             rasterizer = GaussianRasterizer(raster_settings=raster_settings)
             
@@ -2754,21 +2765,26 @@ class GaussianRenderer:
             opacities = (self.pc.get_opacity * self.point_opacity).clamp(0.0, 1.0)
             scales = self.pc.get_scaling * self.point_size
 
-            raster_settings = GaussianRasterizationSettings(
-                image_height=image_height,
-                image_width=image_width,
-                tanfovx=math.tan(cam.FoVx * 0.5),
-                tanfovy=math.tan(cam.FoVy * 0.5),
-                bg=bg,
-                scale_modifier=1.0,
-                viewmatrix=cam.world_view_transform,
-                projmatrix=cam.full_proj_transform,
-                sh_degree=0,
-                campos=cam.camera_center,
-                prefiltered=False,
-                debug=False,
-                antialiasing=False
-            )
+            kwargs = {
+                'image_height': image_height,
+                'image_width': image_width,
+                'tanfovx': math.tan(cam.FoVx * 0.5),
+                'tanfovy': math.tan(cam.FoVy * 0.5),
+                'bg': bg,
+                'scale_modifier': 1.0,
+                'viewmatrix': cam.world_view_transform,
+                'projmatrix': cam.full_proj_transform,
+                'sh_degree': 0,
+                'campos': cam.camera_center,
+                'prefiltered': False,
+                'debug': False,
+            }
+            if hasattr(GaussianRasterizationSettings, '_fields'):
+                if 'antialiasing' in GaussianRasterizationSettings._fields:
+                    kwargs['antialiasing'] = False
+                if 'ring_mode' in GaussianRasterizationSettings._fields:
+                    kwargs['ring_mode'] = False
+            raster_settings = GaussianRasterizationSettings(**kwargs)
 
             rasterizer = GaussianRasterizer(raster_settings=raster_settings)
             result = rasterizer(
@@ -2790,7 +2806,7 @@ class GaussianRenderer:
 
     def render(self, camera, resolution_scale=1.0):
         """渲染一帧"""
-        if self.render_mode == self.RENDER_MODE_SPLAT:
+        if self.render_mode in (self.RENDER_MODE_SPLAT, self.RENDER_MODE_RING):
             return self._render_gaussians(camera, resolution_scale=resolution_scale)
 
         return self._render_points(camera, resolution_scale=resolution_scale)
