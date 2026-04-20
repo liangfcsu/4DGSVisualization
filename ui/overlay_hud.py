@@ -3,8 +3,7 @@ ViewportOverlay — floating HUD elements on top of the render viewport.
 
 Layout:
   ┌─────────────────────────────────────────────────┐
-  │ [Scene / Mode / Camera]     [RGB][Depth][Motion] │
-  │                              [Gaussian]          │
+  │ [Scene / Mode / Camera]   [RGB][Gaussian][Ring] │
   │                                                   │
   │                                                   │
   │ [操作提示]                        FPS: 60         │

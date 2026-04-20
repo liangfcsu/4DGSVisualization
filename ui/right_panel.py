@@ -1,6 +1,5 @@
 """
-RightInfoPanel — card-based information display
-(Scene Info, Gaussian Stats, Performance, Stream & Cache, Debug Summary).
+RightInfoPanel — compact runtime information with only live, trustworthy stats.
 """
 
 from PyQt5.QtWidgets import (
@@ -58,10 +57,9 @@ class RightInfoPanel(QWidget):
         outer.addWidget(scroll, stretch=1)
 
         self._build_scene_card()
-        self._build_gaussian_card()
         self._build_performance_card()
         self._build_cache_card()
-        self._build_debug_card()
+        self._build_activity_card()
         self._layout.addStretch()
 
     # ── Scene Info ────────────────────────────────────────────────────────
@@ -73,20 +71,8 @@ class RightInfoPanel(QWidget):
         self._v_frame = self.scene_card.add_row("帧")
         self._v_camera_mode = self.scene_card.add_row("相机")
         self._v_display_mode = self.scene_card.add_row("显示")
-        self._v_window = self.scene_card.add_row("窗口区间")
+        self._v_total_gauss = self.scene_card.add_row("高斯数")
         self._layout.addWidget(self.scene_card)
-
-    # ── Gaussian Stats ────────────────────────────────────────────────────
-
-    def _build_gaussian_card(self):
-        self.gauss_card = InfoCard("GAUSSIAN STATS")
-        self._v_total_gauss = self.gauss_card.add_row("总数")
-        self._v_static      = self.gauss_card.add_row("Static")
-        self._v_persistent  = self.gauss_card.add_row("Persistent")
-        self._v_ephemeral   = self.gauss_card.add_row("Ephemeral")
-        self._v_active      = self.gauss_card.add_row("Active")
-        self._v_visible     = self.gauss_card.add_row("Visible")
-        self._layout.addWidget(self.gauss_card)
 
     # ── Performance ───────────────────────────────────────────────────────
 
@@ -111,15 +97,12 @@ class RightInfoPanel(QWidget):
         self._v_preload = self.cache_card.add_row("预加载")
         self._layout.addWidget(self.cache_card)
 
-    # ── Debug Summary ─────────────────────────────────────────────────────
+    # ── Activity ──────────────────────────────────────────────────────────
 
-    def _build_debug_card(self):
-        self.debug_card = InfoCard("DEBUG SUMMARY")
-        self._v_active_set = self.debug_card.add_row("Active Set")
-        self._v_overlay = self.debug_card.add_row("Overlay")
-        self._v_layer_filter = self.debug_card.add_row("Layer Filter")
-        self._v_last_event = self.debug_card.add_row("最近事件")
-        self._layout.addWidget(self.debug_card)
+    def _build_activity_card(self):
+        self.activity_card = InfoCard("ACTIVITY")
+        self._v_last_event = self.activity_card.add_row("最近事件")
+        self._layout.addWidget(self.activity_card)
 
     # ── Update all values ─────────────────────────────────────────────────
 
@@ -145,17 +128,8 @@ class RightInfoPanel(QWidget):
                 vis_label = label
                 break
         self._v_display_mode.setText(vis_label)
-        self._v_window.setText(state.cache_window or "—")
-
-        # Gaussian Stats
         total_g = state.total_gaussians
         self._v_total_gauss.setText(f"{total_g:,}" if total_g > 0 else "—")
-        # TODO: These require per-frame layer classification from the 4DGS pipeline
-        self._v_static.setText("—")
-        self._v_persistent.setText("—")
-        self._v_ephemeral.setText("—")
-        self._v_active.setText(f"{total_g:,}" if total_g > 0 else "—")
-        self._v_visible.setText("—")
 
         # Performance
         self._v_viewer_fps.setText(f"{state.viewer_fps:.1f}")
@@ -177,11 +151,6 @@ class RightInfoPanel(QWidget):
             self._v_cache_hit.setText("—")
         self._v_io_status.setText(extra.get("io_status", "—"))
         self._v_preload.setText(extra.get("preload_status", "—"))
-
-        # Debug Summary
-        self._v_active_set.setText("ON" if state.show_active_set else "OFF")
-        self._v_overlay.setText("ON" if state.show_diagnostics else "OFF")
-        self._v_layer_filter.setText("默认")
         self._v_last_event.setText(extra.get("last_event", "—"))
 
     def set_last_event(self, text: str):

@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
-from .state import UIState, FPS_PRESETS
+from .state import UIState
 from .style import SP_SM, SP_MD, C_TEXT2, F_CAPTION, S
 
 

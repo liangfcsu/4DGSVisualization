@@ -1,15 +1,15 @@
 """
-LeftControlPanel — collapsible parameter groups (Display, Gaussian, Camera, 4DGS Layers, Debug).
+LeftControlPanel — collapsible parameter groups with only active controls.
 """
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QComboBox, QDoubleSpinBox, QCheckBox,
-    QScrollArea, QSizePolicy, QFrame,
+    QPushButton, QComboBox, QDoubleSpinBox,
+    QScrollArea, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
-from .state import UIState, RESOLUTION_OPTIONS, CAMERA_MODES, CAMERA_MODE_TO_INDEX
+from .state import UIState, RESOLUTION_OPTIONS, CAMERA_MODES
 from .style import LEFT_PANEL_W, C_BORDER, SP_SM, SP_MD, SP_LG, S
 from .widgets import CollapsibleSection, Separator
 
@@ -22,23 +22,15 @@ class LeftControlPanel(QWidget):
     background_changed      = pyqtSignal(int)
     gamma_changed           = pyqtSignal(float)
     exposure_changed        = pyqtSignal(float)
-    antialiasing_changed    = pyqtSignal(bool)
     point_size_changed      = pyqtSignal(float)
-    splat_scale_changed     = pyqtSignal(float)
     alpha_scale_changed     = pyqtSignal(float)
     ring_size_changed       = pyqtSignal(float)
-    show_centers_changed    = pyqtSignal(bool)
-    show_ellipsoids_changed = pyqtSignal(bool)
-    show_pointcloud_changed = pyqtSignal(bool)
-    show_trails_changed     = pyqtSignal(bool)
     camera_mode_changed     = pyqtSignal(str)
     camera_selected         = pyqtSignal(int)
     fov_changed             = pyqtSignal(float)
     move_speed_changed      = pyqtSignal(float)
     rot_speed_changed       = pyqtSignal(float)
     reset_camera_clicked    = pyqtSignal()
-    layer_changed           = pyqtSignal(str, bool)
-    debug_changed           = pyqtSignal(str, bool)
 
     def __init__(self, state: UIState, cameras_info=None, parent=None):
         super().__init__(parent)
@@ -84,8 +76,6 @@ class LeftControlPanel(QWidget):
         self._build_display_section()
         self._build_gaussian_section()
         self._build_camera_section()
-        self._build_layers_section()
-        self._build_debug_section()
         self._layout.addStretch()
 
     # ── Display Section ───────────────────────────────────────────────────
@@ -134,13 +124,6 @@ class LeftControlPanel(QWidget):
         row2.addWidget(self.exposure_spin)
         cl.addLayout(row2)
 
-        # Antialiasing
-        self.aa_check = QCheckBox("抗锯齿")
-        self.aa_check.setChecked(self.state.antialiasing)
-        self.aa_check.setToolTip("抗锯齿")
-        self.aa_check.toggled.connect(lambda v: self.antialiasing_changed.emit(v))
-        cl.addWidget(self.aa_check)
-
         self._layout.addWidget(sec)
 
     # ── Gaussian Section ──────────────────────────────────────────────────
@@ -162,29 +145,17 @@ class LeftControlPanel(QWidget):
         row.addWidget(self.point_size_spin)
         cl.addLayout(row)
 
-        # Splat scale
-        row2 = QHBoxLayout()
-        row2.addWidget(self._lbl("Splat Scale"))
-        self.splat_scale_spin = QDoubleSpinBox()
-        self.splat_scale_spin.setRange(0.1, 5.0)
-        self.splat_scale_spin.setSingleStep(0.1)
-        self.splat_scale_spin.setValue(self.state.splat_scale)
-        self.splat_scale_spin.setToolTip("Splat 缩放因子")
-        self.splat_scale_spin.valueChanged.connect(lambda v: self.splat_scale_changed.emit(v))
-        row2.addWidget(self.splat_scale_spin)
-        cl.addLayout(row2)
-
         # Alpha scale
-        row3 = QHBoxLayout()
-        row3.addWidget(self._lbl("Alpha Scale"))
+        row2 = QHBoxLayout()
+        row2.addWidget(self._lbl("不透明度"))
         self.alpha_scale_spin = QDoubleSpinBox()
         self.alpha_scale_spin.setRange(0.1, 5.0)
         self.alpha_scale_spin.setSingleStep(0.1)
         self.alpha_scale_spin.setValue(self.state.alpha_scale)
-        self.alpha_scale_spin.setToolTip("全局不透明度缩放因子")
+        self.alpha_scale_spin.setToolTip("点模式下的全局不透明度倍率")
         self.alpha_scale_spin.valueChanged.connect(lambda v: self.alpha_scale_changed.emit(v))
-        row3.addWidget(self.alpha_scale_spin)
-        cl.addLayout(row3)
+        row2.addWidget(self.alpha_scale_spin)
+        cl.addLayout(row2)
 
         # Ring Size
         row_ring = QHBoxLayout()
@@ -198,28 +169,6 @@ class LeftControlPanel(QWidget):
         self.ring_size_spin.valueChanged.connect(lambda v: self.ring_size_changed.emit(v))
         row_ring.addWidget(self.ring_size_spin)
         cl.addLayout(row_ring)
-
-        # Checkboxes
-        cl.addWidget(Separator())
-        self.chk_centers = QCheckBox("显示高斯中心")
-        self.chk_centers.setToolTip("显示高斯中心点")
-        self.chk_centers.toggled.connect(lambda v: self.show_centers_changed.emit(v))
-        cl.addWidget(self.chk_centers)
-
-        self.chk_ellipsoids = QCheckBox("显示 Ellipsoid")
-        self.chk_ellipsoids.setToolTip("显示高斯椭球")
-        self.chk_ellipsoids.toggled.connect(lambda v: self.show_ellipsoids_changed.emit(v))
-        cl.addWidget(self.chk_ellipsoids)
-
-        self.chk_pointcloud = QCheckBox("显示 Point Cloud")
-        self.chk_pointcloud.setToolTip("显示原始点云")
-        self.chk_pointcloud.toggled.connect(lambda v: self.show_pointcloud_changed.emit(v))
-        cl.addWidget(self.chk_pointcloud)
-
-        self.chk_trails = QCheckBox("显示 Motion Trails")
-        self.chk_trails.setToolTip("显示高斯运动轨迹")
-        self.chk_trails.toggled.connect(lambda v: self.show_trails_changed.emit(v))
-        cl.addWidget(self.chk_trails)
 
         self._layout.addWidget(sec)
 
@@ -295,57 +244,6 @@ class LeftControlPanel(QWidget):
         btn_reset.setToolTip("重置相机到初始位置 (R)")
         btn_reset.clicked.connect(self.reset_camera_clicked.emit)
         cl.addWidget(btn_reset)
-
-        self._layout.addWidget(sec)
-
-    # ── 4DGS Layers Section ───────────────────────────────────────────────
-
-    def _build_layers_section(self):
-        sec = CollapsibleSection("4DGS Layers", expanded=False)
-        cl = sec.content_layout
-
-        self._layer_checks = {}
-        layers = [
-            ("static",      "Static",            True),
-            ("persistent",  "Persistent",         True),
-            ("ephemeral",   "Ephemeral",          True),
-            ("spawned",     "Spawned",            True),
-            ("pruned",      "Pruned",             False),
-            ("frustums",    "Camera Frustums",    False),
-            ("centers",     "Gaussian Centers",   False),
-            ("trails",      "Motion Trails",      False),
-        ]
-        for key, label, default in layers:
-            chk = QCheckBox(label)
-            chk.setChecked(default)
-            chk.setToolTip(f"TODO: 切换 {label} 图层显隐")
-            chk.toggled.connect(lambda v, k=key: self.layer_changed.emit(k, v))
-            cl.addWidget(chk)
-            self._layer_checks[key] = chk
-
-        self._layout.addWidget(sec)
-
-    # ── Debug Section ─────────────────────────────────────────────────────
-
-    def _build_debug_section(self):
-        sec = CollapsibleSection("Debug", expanded=False)
-        cl = sec.content_layout
-
-        self._debug_checks = {}
-        options = [
-            ("active_set",       "显示 Active Set"),
-            ("visible_gauss",    "显示 Visible Gaussians"),
-            ("cache_region",     "显示 Cache Region"),
-            ("window_interval",  "显示 Window Interval"),
-            ("diagnostics",      "Diagnostics Overlay"),
-            ("bounding_boxes",   "Bounding Boxes"),
-        ]
-        for key, label in options:
-            chk = QCheckBox(label)
-            chk.setToolTip(f"TODO: {label}")
-            chk.toggled.connect(lambda v, k=key: self.debug_changed.emit(k, v))
-            cl.addWidget(chk)
-            self._debug_checks[key] = chk
 
         self._layout.addWidget(sec)
 

@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QSize, pyqtSignal
 
 from .state import (
-    UIState, VISUALIZATION_MODES, CAMERA_MODES, PROJECT_MODES,
+    UIState, VISUALIZATION_MODES, CAMERA_MODES,
 )
 from .style import C_ACCENT, C_TEXT2, F_CAPTION, S
 
@@ -21,11 +21,9 @@ class TopBar(QToolBar):
 
     vis_mode_changed    = pyqtSignal(str)   # visualization mode key
     camera_mode_changed = pyqtSignal(str)   # camera mode key
-    project_mode_changed = pyqtSignal(str)  # 3DGS / 4DGS / Hybrid
     reset_clicked       = pyqtSignal()
     screenshot_clicked  = pyqtSignal()
     fullscreen_clicked  = pyqtSignal()
-    settings_clicked    = pyqtSignal()
 
     def __init__(self, state: UIState, parent=None):
         super().__init__("TopBar", parent)
@@ -37,7 +35,7 @@ class TopBar(QToolBar):
         self._build()
 
     def _build(self):
-        # ── Left: title + scene badge + project mode ──
+        # ── Left: title + scene badge + runtime mode ──
         title = QLabel("4DGS Viewer")
         title.setObjectName("AppTitle")
         self.addWidget(title)
@@ -53,20 +51,7 @@ class TopBar(QToolBar):
 
         self.addSeparator()
 
-        # ── Center: project mode | vis mode | camera mode ──
-        self.addWidget(self._lbl("模式:"))
-        self.project_combo = QComboBox()
-        for pm in PROJECT_MODES:
-            self.project_combo.addItem(pm)
-        self.project_combo.setFixedWidth(S(80))
-        self.project_combo.setToolTip("切换项目模式 (3DGS / 4DGS / Hybrid)")
-        idx = PROJECT_MODES.index(self.state.project_mode) if self.state.project_mode in PROJECT_MODES else 1
-        self.project_combo.setCurrentIndex(idx)
-        self.project_combo.currentIndexChanged.connect(self._on_project_mode)
-        self.addWidget(self.project_combo)
-
-        self.addSeparator()
-
+        # ── Center: vis mode | camera mode ──
         self.addWidget(self._lbl("显示:"))
         self.vis_combo = QComboBox()
         for label, _key in VISUALIZATION_MODES:
@@ -129,10 +114,6 @@ class TopBar(QToolBar):
                 return
 
     def sync_project_mode(self, mode: str):
-        idx = PROJECT_MODES.index(mode) if mode in PROJECT_MODES else 0
-        self.project_combo.blockSignals(True)
-        self.project_combo.setCurrentIndex(idx)
-        self.project_combo.blockSignals(False)
         self.mode_badge.setText(mode)
 
     def set_scene_name(self, name: str):
@@ -149,12 +130,6 @@ class TopBar(QToolBar):
         if 0 <= idx < len(CAMERA_MODES):
             _label, key = CAMERA_MODES[idx]
             self.camera_mode_changed.emit(key)
-
-    def _on_project_mode(self, idx):
-        if 0 <= idx < len(PROJECT_MODES):
-            mode = PROJECT_MODES[idx]
-            self.mode_badge.setText(mode)
-            self.project_mode_changed.emit(mode)
 
     @staticmethod
     def _lbl(text: str) -> QLabel:

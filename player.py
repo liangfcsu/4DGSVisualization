@@ -84,9 +84,9 @@ except ImportError:
 
 # ─── 第四步：导入 UI 模块 ────────────────────────────────────────────────────
 from ui.state import (
-    UIState, RESOLUTION_OPTIONS, FPS_PRESETS,
-    VISUALIZATION_MODES, VIS_TO_RENDER_MODE, QUICK_VIS_MODES,
-    CAMERA_MODES, CAMERA_MODE_TO_INDEX,
+    UIState, RESOLUTION_OPTIONS,
+    VISUALIZATION_MODES, VIS_TO_RENDER_MODE,
+    CAMERA_MODES,
 )
 from ui.style import GLOBAL_QSS, build_qss, F_CAPTION
 from ui.top_bar import TopBar
@@ -503,7 +503,6 @@ class MainWindow(QMainWindow):
         # ── TopBar ──
         self.top_bar.vis_mode_changed.connect(self._set_vis_mode)
         self.top_bar.camera_mode_changed.connect(self._set_camera_mode)
-        self.top_bar.project_mode_changed.connect(self._on_project_mode_changed)
         self.top_bar.reset_clicked.connect(self._reset_camera)
         self.top_bar.screenshot_clicked.connect(self._screenshot)
         self.top_bar.fullscreen_clicked.connect(self._toggle_fullscreen)
@@ -514,22 +513,14 @@ class MainWindow(QMainWindow):
         self.left_panel.point_size_changed.connect(self._on_point_size_changed)
         self.left_panel.gamma_changed.connect(self._on_gamma_changed)
         self.left_panel.exposure_changed.connect(self._on_exposure_changed)
-        self.left_panel.antialiasing_changed.connect(self._on_antialiasing_changed)
-        self.left_panel.splat_scale_changed.connect(self._on_splat_scale_changed)
         self.left_panel.alpha_scale_changed.connect(self._on_alpha_scale_changed)
         self.left_panel.ring_size_changed.connect(self._on_ring_size_changed)
-        self.left_panel.show_centers_changed.connect(lambda v: self._on_gaussian_vis("centers", v))
-        self.left_panel.show_ellipsoids_changed.connect(lambda v: self._on_gaussian_vis("ellipsoids", v))
-        self.left_panel.show_pointcloud_changed.connect(lambda v: self._on_gaussian_vis("pointcloud", v))
-        self.left_panel.show_trails_changed.connect(lambda v: self._on_gaussian_vis("trails", v))
         self.left_panel.camera_mode_changed.connect(self._set_camera_mode)
         self.left_panel.camera_selected.connect(self._on_camera_selected)
         self.left_panel.fov_changed.connect(self._on_fov_changed)
         self.left_panel.move_speed_changed.connect(self._on_move_speed_changed)
         self.left_panel.rot_speed_changed.connect(self._on_rot_speed_changed)
         self.left_panel.reset_camera_clicked.connect(self._reset_camera)
-        self.left_panel.layer_changed.connect(self._on_layer_changed)
-        self.left_panel.debug_changed.connect(self._on_debug_changed)
 
         # ── Bottom Bar ──
         if self.seq:
@@ -719,6 +710,8 @@ class MainWindow(QMainWindow):
             stats = self.seq.get_load_stats()
             if stats['total_accesses'] > 0:
                 self.ui_state.cache_hit_rate = stats['hit_rate']
+            else:
+                self.ui_state.cache_hit_rate = 0.0
 
         # GPU memory (not every frame - every 30 frames)
         if self._update_counter % 30 == 0 and torch.cuda.is_available():
@@ -744,9 +737,22 @@ class MainWindow(QMainWindow):
 
         # Update right panel (throttled to every 5 frames for performance)
         if self._update_counter % 5 == 0:
+            preload_status = "—"
+            io_status = f"×{_recommended_io_workers()}"
+            if self.seq:
+                io_status = f"×{self.seq.io_workers}"
+                if self.seq.load_mode == SequenceManager.LOAD_MODE_PRELOAD_CPU:
+                    if getattr(self.seq, "background_preload_completed", False):
+                        preload_status = "完成"
+                    else:
+                        preload_status = f"{len(self.seq.cpu_cache)}/{self.seq.num_frames}"
+                elif self.seq.load_mode == SequenceManager.LOAD_MODE_PRELOAD_GPU:
+                    preload_status = f"{len(self.seq.gpu_cache)}/{self.seq.num_frames}"
+                else:
+                    preload_status = "按需预取"
             extra = {
-                "io_status": f"×{_recommended_io_workers()}",
-                "preload_status": "完成" if (self.seq and not self.seq.playing) else "—",
+                "io_status": io_status,
+                "preload_status": preload_status,
                 "last_event": self._last_event or "—",
             }
             self.right_panel.update_info(self.ui_state, extra)
@@ -802,21 +808,17 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _set_vis_mode(self, mode_key: str):
-        """Set visualization mode (may change renderer mode or show placeholder)."""
+        """Set visualization mode."""
         render_mode = _vis_to_render_mode(mode_key)
-        if render_mode is not None:
-            self.renderer.set_render_mode(render_mode)
-            self.ui_state.vis_mode = mode_key
-            self.top_bar.sync_vis_mode(mode_key)
-            self.left_panel.sync_camera_mode(self.ui_state.camera_mode)
-            self.overlay.sync_vis_mode(mode_key)
-            vis_label = dict((k, l) for l, k in VISUALIZATION_MODES).get(mode_key, mode_key)
-            self._set_last_event(f"显示: {vis_label}")
-            self.toast.show_message(f"显示模式: {vis_label}", 1500)
-        else:
-            # Placeholder mode not yet implemented
-            vis_label = dict((k, l) for l, k in VISUALIZATION_MODES).get(mode_key, mode_key)
-            self.toast.show_message(f"{vis_label} 模式即将支持", 2000)
+        if render_mode is None:
+            return
+        self.renderer.set_render_mode(render_mode)
+        self.ui_state.vis_mode = mode_key
+        self.top_bar.sync_vis_mode(mode_key)
+        self.overlay.sync_vis_mode(mode_key)
+        vis_label = dict((k, l) for l, k in VISUALIZATION_MODES).get(mode_key, mode_key)
+        self._set_last_event(f"显示: {vis_label}")
+        self.toast.show_message(f"显示模式: {vis_label}", 1500)
         self._update_overlay_scene()
         self._request_render()
 
@@ -906,18 +908,11 @@ class MainWindow(QMainWindow):
         self.ui_state.exposure = value
         self._request_render()
 
-    def _on_antialiasing_changed(self, enabled: bool):
-        self.ui_state.antialiasing = enabled
-        self._request_render()
-
-    def _on_splat_scale_changed(self, value: float):
-        self.ui_state.splat_scale = value
-        self._request_render()
-
     def _on_alpha_scale_changed(self, value: float):
         self.ui_state.alpha_scale = value
         # Map alpha_scale to renderer point_opacity
         self.renderer.set_point_style(opacity=min(1.0, max(0.05, value)))
+        self._request_render()
 
     def _on_ring_size_changed(self, value: float):
         self.ui_state.ring_size = value
@@ -942,28 +937,11 @@ class MainWindow(QMainWindow):
         self.camera.rot_speed = value
         self._set_last_event(f"旋转速度: {value:.3f}")
 
-    def _on_project_mode_changed(self, mode: str):
-        self.ui_state.project_mode = mode
-        self._set_last_event(f"项目模式: {mode}")
-
     def _on_loop_toggled(self, enabled: bool):
         self.ui_state.loop_enabled = enabled
         if self.seq:
             self.seq.loop = enabled
         self._set_last_event(f"循环播放: {'ON' if enabled else 'OFF'}")
-
-    def _on_gaussian_vis(self, key: str, enabled: bool):
-        """Handle Gaussian visualization toggles — map to render mode if applicable."""
-        if key == "pointcloud" and enabled:
-            self.renderer.set_render_mode(GaussianRenderer.RENDER_MODE_POINTS)
-            self.ui_state.vis_mode = "gaussian"
-            self.top_bar.sync_vis_mode("gaussian")
-        elif key == "centers" and enabled:
-            self.renderer.set_render_mode(GaussianRenderer.RENDER_MODE_RING)
-            self.ui_state.vis_mode = "ring"
-            self.top_bar.sync_vis_mode("ring")
-        self._set_last_event(f"高斯显示 {key}: {'ON' if enabled else 'OFF'}")
-        self._request_render()
 
     # ═══════════════════════════════════════════════════════════════════════
     # Actions — Playback
@@ -1075,29 +1053,6 @@ class MainWindow(QMainWindow):
         self._set_last_event(f"截图: {fname}")
         self.toast.show_message(f"截图已保存: {fname} ({w}×{h})", 3000)
         print(f"截图已保存: {fname}  ({w}×{h})")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # Actions — 4DGS Layer & Debug (placeholder hooks)
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _on_layer_changed(self, key: str, enabled: bool):
-        """TODO: Connect to rendering pipeline layer filtering when available."""
-        setattr(self.ui_state, f"layer_{key}" if hasattr(self.ui_state, f"layer_{key}") else key, enabled)
-        self._set_last_event(f"图层 {key}: {'ON' if enabled else 'OFF'}")
-
-    def _on_debug_changed(self, key: str, enabled: bool):
-        """TODO: Connect to debug overlay rendering when available."""
-        mapping = {
-            "active_set": "show_active_set",
-            "visible_gauss": "show_visible_gaussians",
-            "cache_region": "show_cache_region",
-            "window_interval": "show_window_interval",
-            "diagnostics": "show_diagnostics",
-            "bounding_boxes": "show_bounding_boxes",
-        }
-        attr = mapping.get(key)
-        if attr:
-            setattr(self.ui_state, attr, enabled)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Helpers
