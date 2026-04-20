@@ -323,6 +323,7 @@ class MainWindow(QMainWindow):
         self._shortcuts    = []
         self._last_event   = ""
         self._update_counter = 0
+        self._pending_seek_preview = None
 
         # ── UI State ──
         self.ui_state = UIState()
@@ -339,6 +340,7 @@ class MainWindow(QMainWindow):
         if seq:
             self.ui_state.load_mode = "gpu_stream" if getattr(seq, '_gpu_stream_mode', False) else seq.load_mode
             self.ui_state.playback_fps = seq.fps
+            self.ui_state.loop_enabled = getattr(seq, "loop", True)
 
         self.setWindowTitle(f"4DGS Viewer · {self.ui_state.scene_name}")
         self.setFocusPolicy(Qt.StrongFocus)
@@ -486,6 +488,8 @@ class MainWindow(QMainWindow):
         self.left_panel.rot_speed_spin.blockSignals(True)
         self.left_panel.rot_speed_spin.setValue(self.camera.rot_speed)
         self.left_panel.rot_speed_spin.blockSignals(False)
+        if self.seq:
+            self.bottom_bar.sync_loop(self.ui_state.loop_enabled)
         self.overlay.sync_vis_mode(self.ui_state.vis_mode)
         self.overlay.update_scene_label(
             self.ui_state.scene_name, self.ui_state.vis_mode, self.ui_state.camera_mode
@@ -530,10 +534,10 @@ class MainWindow(QMainWindow):
         # ── Bottom Bar ──
         if self.seq:
             self.bottom_bar.play_toggled.connect(self._on_play_toggled)
-            self.bottom_bar.first_frame.connect(lambda: (self.seq.set_frame(0), self._reload()))
+            self.bottom_bar.first_frame.connect(lambda: self._jump_to_frame(0))
             self.bottom_bar.prev_frame.connect(lambda: (self.seq.prev_frame(), self._reload()))
             self.bottom_bar.next_frame.connect(lambda: (self.seq.next_frame(), self._reload()))
-            self.bottom_bar.last_frame.connect(lambda: (self.seq.set_frame(self.seq.num_frames - 1), self._reload()))
+            self.bottom_bar.last_frame.connect(lambda: self._jump_to_frame(self.seq.num_frames - 1))
             self.bottom_bar.seek_moved.connect(self._on_seek_moved)
             self.bottom_bar.seek_released.connect(self._on_seek_released)
             self.bottom_bar.fps_changed.connect(lambda v: (self.seq.set_fps(v), self._request_render()))
@@ -557,8 +561,8 @@ class MainWindow(QMainWindow):
             self._register_shortcut(Qt.Key_Space, self._toggle_play)
             self._register_shortcut(Qt.Key_Left, lambda: (self.seq.prev_frame(), self._reload()))
             self._register_shortcut(Qt.Key_Right, lambda: (self.seq.next_frame(), self._reload()))
-            self._register_shortcut(Qt.Key_Home, lambda: (self.seq.set_frame(0), self._reload()))
-            self._register_shortcut(Qt.Key_End, lambda: (self.seq.set_frame(self.seq.num_frames - 1), self._reload()))
+            self._register_shortcut(Qt.Key_Home, lambda: self._jump_to_frame(0))
+            self._register_shortcut(Qt.Key_End, lambda: self._jump_to_frame(self.seq.num_frames - 1))
             self._register_shortcut(Qt.Key_Minus, lambda: self._adj_fps(-5.0))
             self._register_shortcut(Qt.Key_Equal, lambda: self._adj_fps(+5.0))
             self._register_shortcut(Qt.Key_Plus, lambda: self._adj_fps(+5.0))
@@ -595,14 +599,27 @@ class MainWindow(QMainWindow):
             # 序列推进 (不改动)
             if self.seq:
                 self.seq.service_prefetch()
+                if self._pending_seek_preview is not None and not self.seq.playing:
+                    if self._apply_seek_preview_if_ready():
+                        frame_updated = True
                 if self.seq.playing:
                     due = self.seq.consume_due_frames()
                     if due > 0:
                         direction = 1 if self.seq.play_direction >= 0 else -1
+                        if not self.seq.loop:
+                            remaining = self.seq._remaining_steps_in_direction(direction=direction)
+                            if remaining <= 0:
+                                self.seq.playing = False
+                                self._request_render()
+                                due = 0
+                            else:
+                                due = min(due, remaining)
+
+                    if due > 0:
                         ready_raw_idx = None
                         for offset in range(due, 0, -1):
                             raw_candidate = self.seq.current_frame + direction * offset
-                            candidate = raw_candidate % self.seq.num_frames
+                            candidate = self.seq._normalize_frame_idx(raw_candidate)
                             if self.seq.is_frame_ready(candidate, prefer_device=self._preferred_frame_device):
                                 ready_raw_idx = raw_candidate
                                 break
@@ -611,8 +628,10 @@ class MainWindow(QMainWindow):
                             self.seq.set_frame(ready_raw_idx)
                             self._reload()
                             frame_updated = True
+                            if not self.seq.loop and self.seq.at_playback_boundary(direction=direction):
+                                self.seq.playing = False
                         else:
-                            target_idx = (self.seq.current_frame + direction * due) % self.seq.num_frames
+                            target_idx = self.seq._normalize_frame_idx(self.seq.current_frame + direction * due)
                             self.seq.request_frame(target_idx, prefer_device=self._preferred_frame_device)
 
             if not (self._needs_render or frame_updated or self.view.is_interacting()):
@@ -648,7 +667,27 @@ class MainWindow(QMainWindow):
         if self.seq:
             frame = self.seq.get_current_frame_data(prefer_device=self._preferred_frame_device)
             self.pc.apply_frame(frame)
+            self._pending_seek_preview = None
         self._request_render()
+
+    def _jump_to_frame(self, frame_idx: int):
+        if not self.seq:
+            return
+        self.seq.play_direction = 1
+        self.seq.set_frame(frame_idx, update_direction=False)
+        self._reload()
+
+    def _apply_seek_preview_if_ready(self) -> bool:
+        if not self.seq or self._pending_seek_preview is None:
+            return False
+        target_idx = self._pending_seek_preview
+        if not self.seq.is_frame_ready(target_idx, prefer_device=self._preferred_frame_device):
+            return False
+        frame = self.seq.get_current_frame_data(prefer_device=self._preferred_frame_device)
+        self.pc.apply_frame(frame)
+        self._pending_seek_preview = None
+        self._request_render()
+        return True
 
     # ═══════════════════════════════════════════════════════════════════════
     # UI Update (每帧刷新各面板)
@@ -932,23 +971,31 @@ class MainWindow(QMainWindow):
 
     def _on_play_toggled(self, checked: bool):
         if self.seq:
+            if checked:
+                self.seq.play_direction = 1
             self.seq.playing = checked
             self.seq.last_update_time = time.time()
             self._reload()
 
     def _toggle_play(self):
         if self.seq:
-            self.seq.toggle_play()
+            playing = self.seq.toggle_play()
+            if playing:
+                self.seq.play_direction = 1
             self._reload()
 
     def _on_seek_moved(self, value: int):
         if self.seq:
-            self.seq.set_frame(value)
+            self.seq.play_direction = 1
+            self.seq.set_frame(value, update_direction=False)
             self.seq.request_frame(value, prefer_device=self._preferred_frame_device)
+            self._pending_seek_preview = value
+            self._apply_seek_preview_if_ready()
 
     def _on_seek_released(self, value: int):
         if self.seq:
-            self.seq.set_frame(value)
+            self.seq.play_direction = 1
+            self.seq.set_frame(value, update_direction=False)
             self._reload()
 
     def _adj_fps(self, delta: float):

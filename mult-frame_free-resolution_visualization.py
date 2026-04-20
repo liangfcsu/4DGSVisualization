@@ -1310,6 +1310,7 @@ class SequenceManager:
         self.current_frame = 0
         self.playing = False
         self.play_direction = 1
+        self.loop = True
         self.fps = max(0.1, float(playback_fps))
         self.last_update_time = time.time()
         self.sh_degree = sh_degree
@@ -1567,28 +1568,54 @@ class SequenceManager:
         return self.LOAD_MODE_GPU_STREAM
     
     def _frame_path(self, frame_idx):
-        return self.frame_paths[frame_idx % self.num_frames]
+        return self.frame_paths[self._normalize_frame_idx(frame_idx)]
 
     def _frame_cache_path(self, frame_idx):
         if self.cache_frame_paths is None:
             return None
-        return self.cache_frame_paths[frame_idx % self.num_frames]
+        return self.cache_frame_paths[self._normalize_frame_idx(frame_idx)]
 
     def _stream_direction(self):
         return 1 if self.play_direction >= 0 else -1
 
+    def _normalize_frame_idx(self, frame_idx, wrap=None):
+        raw_idx = int(frame_idx)
+        should_wrap = self.loop if wrap is None else bool(wrap)
+        if should_wrap:
+            return raw_idx % self.num_frames
+        return max(0, min(raw_idx, self.num_frames - 1))
+
+    def _remaining_steps_in_direction(self, direction=None):
+        direction = self._stream_direction() if direction is None else (1 if direction >= 0 else -1)
+        if self.loop:
+            return self.num_frames - 1 if self.num_frames > 1 else 0
+        if direction >= 0:
+            return max(0, self.num_frames - 1 - self.current_frame)
+        return max(0, self.current_frame)
+
+    def at_playback_boundary(self, direction=None):
+        return self._remaining_steps_in_direction(direction=direction) == 0
+
     def _stream_window_frames(self, total_frames):
         total_frames = max(1, int(total_frames))
         total_frames = min(self.num_frames, total_frames)
-        frames = []
-        offset = 0
         direction = self._stream_direction()
-        while len(frames) < total_frames:
-            frame_idx = (self.current_frame + direction * offset) % self.num_frames
-            if frame_idx not in frames:
-                frames.append(frame_idx)
-            offset += 1
-        return frames
+        if self.loop:
+            frames = []
+            offset = 0
+            while len(frames) < total_frames:
+                frame_idx = (self.current_frame + direction * offset) % self.num_frames
+                if frame_idx not in frames:
+                    frames.append(frame_idx)
+                offset += 1
+            return frames
+
+        if direction >= 0:
+            end_idx = min(self.num_frames, self.current_frame + total_frames)
+            return list(range(self.current_frame, end_idx))
+
+        start_idx = max(0, self.current_frame - total_frames + 1)
+        return list(range(self.current_frame, start_idx - 1, -1))
 
     def _cpu_window_frames(self):
         return self._stream_window_frames(self.cpu_cache_size)
@@ -1887,7 +1914,7 @@ class SequenceManager:
     def _schedule_cpu_prefetch(self, frame_idx):
         if self.executor is None:
             return
-        frame_idx %= self.num_frames
+        frame_idx = self._normalize_frame_idx(frame_idx)
         if frame_idx in self.cpu_cache or frame_idx in self.gpu_cache or frame_idx in self.pending_cpu:
             return
         self.pending_cpu[frame_idx] = self.executor.submit(
@@ -1909,7 +1936,10 @@ class SequenceManager:
         forward_count = self._effective_prefetch_count()
         if forward_count <= 0:
             return []
-        return [(center_idx + offset) % self.num_frames for offset in range(1, forward_count + 1)]
+        return [
+            self._normalize_frame_idx(center_idx + offset)
+            for offset in range(1, forward_count + 1)
+        ]
 
     def _drop_stale_prefetch(self, keep_targets):
         keep = set(keep_targets)
@@ -1982,7 +2012,7 @@ class SequenceManager:
         self.pending_gpu[frame_idx] = (frame_gpu, frame_cpu, ready_event)
 
     def request_frame(self, frame_idx, prefer_device=None):
-        frame_idx %= self.num_frames
+        frame_idx = self._normalize_frame_idx(frame_idx)
         self.service_prefetch()
 
         if prefer_device == "cpu":
@@ -2017,7 +2047,7 @@ class SequenceManager:
             self._schedule_cpu_prefetch(frame_idx)
 
     def is_frame_ready(self, frame_idx, prefer_device=None):
-        frame_idx %= self.num_frames
+        frame_idx = self._normalize_frame_idx(frame_idx)
         self.request_frame(frame_idx, prefer_device=prefer_device)
 
         if prefer_device == "cpu":
@@ -2028,7 +2058,7 @@ class SequenceManager:
         return self._resolve_pending_gpu(frame_idx, block=False) is not None
     
     def _resolve_cpu_frame(self, frame_idx):
-        frame_idx %= self.num_frames
+        frame_idx = self._normalize_frame_idx(frame_idx)
         if frame_idx in self.cpu_cache:
             frame = self.cpu_cache[frame_idx]
             self.cpu_cache.move_to_end(frame_idx)
@@ -2044,7 +2074,7 @@ class SequenceManager:
         return frame
     
     def _ensure_frame_on_gpu(self, frame_idx):
-        frame_idx %= self.num_frames
+        frame_idx = self._normalize_frame_idx(frame_idx)
         self.service_prefetch()
         
         if frame_idx in self.gpu_cache:
@@ -2073,7 +2103,7 @@ class SequenceManager:
     def prefetch_around(self, frame_idx):
         if self.load_mode != self.LOAD_MODE_STREAM:
             return
-        self.current_frame = frame_idx % self.num_frames
+        self.current_frame = self._normalize_frame_idx(frame_idx)
         self.service_prefetch()
     
     def get_current_frame_data(self, prefer_device=None):
@@ -2090,18 +2120,18 @@ class SequenceManager:
     
     def next_frame(self):
         self.play_direction = 1
-        self.current_frame = (self.current_frame + 1) % self.num_frames
+        self.current_frame = self._normalize_frame_idx(self.current_frame + 1)
         self.prefetch_around(self.current_frame)
-    
+
     def prev_frame(self):
         self.play_direction = -1
-        self.current_frame = (self.current_frame - 1) % self.num_frames
+        self.current_frame = self._normalize_frame_idx(self.current_frame - 1)
         self.prefetch_around(self.current_frame)
-    
-    def set_frame(self, frame_idx):
+
+    def set_frame(self, frame_idx, update_direction=True):
         raw_idx = int(frame_idx)
-        next_idx = raw_idx % self.num_frames
-        if raw_idx != self.current_frame:
+        next_idx = self._normalize_frame_idx(raw_idx)
+        if update_direction and raw_idx != self.current_frame:
             self.play_direction = 1 if raw_idx > self.current_frame else -1
         self.current_frame = next_idx
         self.prefetch_around(self.current_frame)

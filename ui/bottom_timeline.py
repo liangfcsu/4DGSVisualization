@@ -190,6 +190,13 @@ class BottomTimelineBar(QWidget):
         self.fps_spin.setValue(fps)
         self.fps_spin.blockSignals(False)
 
+    def sync_loop(self, enabled: bool):
+        if not self.has_sequence:
+            return
+        self.loop_check.blockSignals(True)
+        self.loop_check.setChecked(enabled)
+        self.loop_check.blockSignals(False)
+
     @staticmethod
     def _transport_btn(text: str, tip: str, checkable=False) -> QPushButton:
         btn = QPushButton(text)
