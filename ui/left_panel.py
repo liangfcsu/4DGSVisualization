@@ -26,6 +26,7 @@ class LeftControlPanel(QWidget):
     point_size_changed      = pyqtSignal(float)
     splat_scale_changed     = pyqtSignal(float)
     alpha_scale_changed     = pyqtSignal(float)
+    ring_size_changed       = pyqtSignal(float)
     show_centers_changed    = pyqtSignal(bool)
     show_ellipsoids_changed = pyqtSignal(bool)
     show_pointcloud_changed = pyqtSignal(bool)
@@ -184,6 +185,19 @@ class LeftControlPanel(QWidget):
         self.alpha_scale_spin.valueChanged.connect(lambda v: self.alpha_scale_changed.emit(v))
         row3.addWidget(self.alpha_scale_spin)
         cl.addLayout(row3)
+
+        # Ring Size
+        row_ring = QHBoxLayout()
+        row_ring.addWidget(self._lbl("Ring 宽度"))
+        self.ring_size_spin = QDoubleSpinBox()
+        self.ring_size_spin.setRange(0.05, 0.95)
+        self.ring_size_spin.setSingleStep(0.05)
+        self.ring_size_spin.setDecimals(2)
+        self.ring_size_spin.setValue(self.state.ring_size)
+        self.ring_size_spin.setToolTip("Ring 模式环形宽度 (0.05=细环, 0.95=粗环)")
+        self.ring_size_spin.valueChanged.connect(lambda v: self.ring_size_changed.emit(v))
+        row_ring.addWidget(self.ring_size_spin)
+        cl.addLayout(row_ring)
 
         # Checkboxes
         cl.addWidget(Separator())

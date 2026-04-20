@@ -2888,9 +2888,8 @@ class GaussianRenderer:
             bg = self._background_color(device)
             screenspace = self._get_screenspace_buffer()
 
-            # 使用 SH 零阶近似颜色, 100% 不透明度以便 ring 效果清晰
-            colors_precomp = torch.clamp(self.pc.get_features[:, 0, :] * SH_C0 + 0.5, 0.0, 1.0)
-            opacities = torch.ones_like(self.pc.get_opacity)
+            # 使用训练好的原始不透明度, 保留视角相关的高斯贡献度
+            opacities = self.pc.get_opacity
             scales = self.pc.get_scaling * self.point_size
 
             raster_kwargs = {
@@ -2902,7 +2901,7 @@ class GaussianRenderer:
                 'scale_modifier': 1.0,
                 'viewmatrix': cam.world_view_transform,
                 'projmatrix': cam.full_proj_transform,
-                'sh_degree': 0,
+                'sh_degree': self.pc.active_sh_degree,
                 'campos': cam.camera_center,
                 'prefiltered': False,
                 'debug': False,
@@ -2918,8 +2917,8 @@ class GaussianRenderer:
             result = rasterizer(
                 means3D=xyz,
                 means2D=screenspace,
-                shs=None,
-                colors_precomp=colors_precomp,
+                shs=self.pc.get_features,
+                colors_precomp=None,
                 opacities=opacities,
                 scales=scales,
                 rotations=self.pc.get_rotation,

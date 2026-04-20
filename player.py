@@ -513,6 +513,7 @@ class MainWindow(QMainWindow):
         self.left_panel.antialiasing_changed.connect(self._on_antialiasing_changed)
         self.left_panel.splat_scale_changed.connect(self._on_splat_scale_changed)
         self.left_panel.alpha_scale_changed.connect(self._on_alpha_scale_changed)
+        self.left_panel.ring_size_changed.connect(self._on_ring_size_changed)
         self.left_panel.show_centers_changed.connect(lambda v: self._on_gaussian_vis("centers", v))
         self.left_panel.show_ellipsoids_changed.connect(lambda v: self._on_gaussian_vis("ellipsoids", v))
         self.left_panel.show_pointcloud_changed.connect(lambda v: self._on_gaussian_vis("pointcloud", v))
@@ -878,6 +879,11 @@ class MainWindow(QMainWindow):
         self.ui_state.alpha_scale = value
         # Map alpha_scale to renderer point_opacity
         self.renderer.set_point_style(opacity=min(1.0, max(0.05, value)))
+
+    def _on_ring_size_changed(self, value: float):
+        self.ui_state.ring_size = value
+        self.renderer.ring_size = value
+        self._request_render()
         self._request_render()
 
     def _on_fov_changed(self, value_deg: float):

@@ -77,6 +77,7 @@ class UIState:
         self.point_size: float = 1.0
         self.splat_scale: float = 1.0
         self.alpha_scale: float = 1.0
+        self.ring_size: float = 0.3
         self.show_gaussian_centers: bool = False
         self.show_ellipsoids: bool = False
         self.show_point_cloud: bool = False
