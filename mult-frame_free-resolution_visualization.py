@@ -3176,6 +3176,41 @@ class InteractiveCamera:
         self.R = self.R @ dR_cam
         self.current_camera_idx = -1
     
+    def rotate_around_point(self, pivot_point, yaw_angle, pitch_angle):
+        """围绕指定3D点旋转相机
+        
+        Args:
+            pivot_point: 3D空间中的旋转中心点 (np.array [3])
+            yaw_angle: 水平旋转角度（度）
+            pitch_angle: 垂直旋转角度（度）
+        """
+        # 转换为弧度
+        yaw_rad = math.radians(yaw_angle)
+        pitch_rad = math.radians(pitch_angle)
+        
+        # 计算相对于pivot的向量
+        to_camera = self.position - pivot_point
+        
+        # Yaw旋转（绕世界Y轴）
+        axis_yaw = np.array([0, 1, 0], dtype=np.float32)
+        R_yaw = self._axis_angle_to_rotation(axis_yaw, yaw_rad)
+        
+        # Pitch旋转（绕相机X轴）
+        axis_pitch = self.R[:, 0]  # 相机X轴
+        R_pitch = self._axis_angle_to_rotation(axis_pitch, pitch_rad)
+        
+        # 先应用yaw再应用pitch
+        to_camera = R_yaw @ to_camera
+        to_camera = R_pitch @ to_camera
+        
+        # 更新位置
+        self.position = pivot_point + to_camera
+        
+        # 更新旋转矩阵
+        self.R = R_pitch @ R_yaw @ self.R
+        
+        self.current_camera_idx = -1
+    
     def orbit_rotate(self, dx, dy):
         """Orbit模式旋转：围绕旋转中心旋转相机"""
         angle_yaw = dx * self.mouse_sensitivity
@@ -3552,6 +3587,63 @@ class GaussianRenderer:
                 .numpy()
                 .astype(np.int64, copy=False)
             )
+    
+    def pick_polygon(self, camera, polygon_norm):
+        """多边形选择：选择多边形内的所有点"""
+        if len(polygon_norm) < 3:
+            return np.empty((0,), dtype=np.int64)
+        
+        with torch.inference_mode():
+            projected = self._project_gaussian_centers(camera)
+            if projected is None:
+                return np.empty((0,), dtype=np.int64)
+            
+            # 转换多边形顶点到像素坐标
+            polygon_pixels = []
+            for norm_x, norm_y in polygon_norm:
+                px = float(norm_x) * camera.width
+                py = float(norm_y) * camera.height
+                polygon_pixels.append((px, py))
+            
+            # 使用射线法判断点是否在多边形内
+            screen_x = projected["screen_x"].detach().cpu().numpy()
+            screen_y = projected["screen_y"].detach().cpu().numpy()
+            valid = projected["valid"].detach().cpu().numpy()
+            
+            inside = np.zeros(len(screen_x), dtype=bool)
+            for i in range(len(screen_x)):
+                if not valid[i]:
+                    continue
+                inside[i] = self._point_in_polygon(screen_x[i], screen_y[i], polygon_pixels)
+            
+            if not np.any(inside):
+                return np.empty((0,), dtype=np.int64)
+            
+            return (
+                projected["indices"]
+                .detach()
+                .cpu()
+                .numpy()[inside]
+                .astype(np.int64, copy=False)
+            )
+    
+    @staticmethod
+    def _point_in_polygon(x, y, polygon):
+        """射线法判断点是否在多边形内"""
+        n = len(polygon)
+        inside = False
+        p1x, p1y = polygon[0]
+        for i in range(1, n + 1):
+            p2x, p2y = polygon[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        return inside
 
     def get_selection_overlay(self, camera, max_points=384):
         selected = self.pc.get_selected_indices()

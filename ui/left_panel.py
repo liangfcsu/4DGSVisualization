@@ -32,6 +32,7 @@ class LeftControlPanel(QWidget):
     rot_speed_changed       = pyqtSignal(float)
     reset_camera_clicked    = pyqtSignal()
     selection_mode_toggled  = pyqtSignal(bool)
+    polygon_selection_toggled = pyqtSignal(bool)
     select_all_clicked      = pyqtSignal()
     clear_selection_clicked = pyqtSignal()
     clear_selection_rect_clicked = pyqtSignal()
@@ -191,9 +192,15 @@ class LeftControlPanel(QWidget):
 
         self.selection_mode_btn = QPushButton("启用选择模式")
         self.selection_mode_btn.setCheckable(True)
-        self.selection_mode_btn.setToolTip("开启后，左键单击可点选，左键拖拽可框选，Shift=添加，Ctrl=移除")
+        self.selection_mode_btn.setToolTip("开启后，左键单击可点选，左键拖拽可框选，Shift=添加，Ctrl=移除 (V)")
         self.selection_mode_btn.toggled.connect(self.selection_mode_toggled.emit)
         cl.addWidget(self.selection_mode_btn)
+        
+        self.polygon_selection_btn = QPushButton("多边形选择")
+        self.polygon_selection_btn.setCheckable(True)
+        self.polygon_selection_btn.setToolTip("开启后，左键添加顶点（最多8个），右键完成。可拖动顶点编辑 (X)")
+        self.polygon_selection_btn.toggled.connect(self.polygon_selection_toggled.emit)
+        cl.addWidget(self.polygon_selection_btn)
 
         self.selection_summary = QLabel("已选 0  |  可见 0  |  隐藏 0  |  删除 0")
         self.selection_summary.setObjectName("SectionLabel")

@@ -184,7 +184,7 @@ class ViewportOverlay(QWidget):
     def _shortcuts_text(self) -> str:
         if self._selection_enabled:
             return (
-                "左键: 点选  |  左键拖拽: 框选  |  Shift: 添加  |  Ctrl: 移除\n"
+                "左键: 点选  |  左键拖拽: 框选  |  X: 多边形选择  |  Shift: 添加  |  Ctrl: 移除\n"
                 "Delete: 删除选中  |  Shift+Delete: 反向删除  |  Shift+C: 清框"
             )
         return (

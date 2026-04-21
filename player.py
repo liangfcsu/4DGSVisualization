@@ -15,6 +15,7 @@
     W/A/S/D      - 相机平移
     Q/E          - 上下
     I/K/J/L      - 旋转
+    X            - 多边形选择（选择模式下）
     U/O          - 滚转
     空格          - 播放/暂停
     ←/→          - 上/下一帧
@@ -171,7 +172,6 @@ class RenderView(QWidget):
         self._mid   = False
         self._last_pos = None
         self._trackball_ratio = 0.75
-        self._rotation_pivot = None  # 旋转中心点
         self._selection_mode = False
         self._selection_drag = False
         self._selection_start = None
@@ -183,6 +183,15 @@ class RenderView(QWidget):
         self._selection_update_timer.setSingleShot(True)
         self._selection_update_timer.setInterval(16)  # ~60fps
         self._selection_pending_update = False
+        
+        # 框选编辑状态
+        self._editing_selection_rect = False
+        self._selection_rect_handle = None  # 当前拖动的句柄: 'move', 'nw', 'ne', 'sw', 'se', 'n', 's', 'e', 'w'
+        self._selection_rect_start_pos = None
+        
+        # 多边形选择
+        self._polygon_selection_mode = False
+        self._polygon_points = []  # 多边形顶点列表
 
         # Overlay references (set by MainWindow)
         self._overlay = None
@@ -203,8 +212,24 @@ class RenderView(QWidget):
         self._selection_start = None
         self._selection_current = None
         self._selection_modifier_mode = None
+        self._polygon_selection_mode = False
+        self._polygon_points = []
+        self._polygon_editing = False
+        self._polygon_drag_index = -1
+        self._persistent_polygon = None
         self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
         self.update()
+    
+    def toggle_polygon_selection(self):
+        """切换多边形选择模式"""
+        if not self._selection_mode:
+            return False
+        self._polygon_selection_mode = not self._polygon_selection_mode
+        if self._polygon_selection_mode:
+            self._polygon_points = []
+            self._persistent_polygon = None
+        self.update()
+        return self._polygon_selection_mode
 
     def set_selection_overlay_points(self, points):
         self._selection_overlay_points = list(points or [])
@@ -288,6 +313,61 @@ class RenderView(QWidget):
             painter.setPen(pen)
             painter.setBrush(QColor(80, 200, 255, 28))
             painter.drawRect(int(rx0), int(ry0), int(rw), int(rh))
+            
+            # 绘制控制点（8个角和边的中点）
+            handle_size = 8
+            handles = self._get_selection_rect_handles()
+            painter.setBrush(QColor(255, 255, 255, 255))
+            painter.setPen(QPen(QColor(80, 200, 255, 255), 2))
+            for handle_name, (hx, hy) in handles.items():
+                painter.drawEllipse(int(hx - handle_size/2), int(hy - handle_size/2), handle_size, handle_size)
+        
+        # 绘制多边形选择（包括持久化的多边形）
+        # 如果有持久化多边形，即使不在多边形选择模式也要显示
+        polygon_to_draw = self._polygon_points if (self._polygon_selection_mode or self._persistent_polygon) and len(self._polygon_points) > 0 else []
+        if len(polygon_to_draw) > 0:
+            pen = QPen(QColor(255, 167, 38, 220))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            
+            # 绘制多边形边
+            for i in range(len(polygon_to_draw) - 1):
+                p1 = polygon_to_draw[i]
+                p2 = polygon_to_draw[i + 1]
+                painter.drawLine(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]))
+            
+            # 如果至少3个点，绘制闭合线
+            if len(polygon_to_draw) >= 3:
+                # 如果是持久化多边形，用实线；否则用虚线
+                if self._persistent_polygon:
+                    pen.setStyle(Qt.SolidLine)
+                else:
+                    pen.setStyle(Qt.DashLine)
+                painter.setPen(pen)
+                p_last = polygon_to_draw[-1]
+                p_first = polygon_to_draw[0]
+                painter.drawLine(int(p_last[0]), int(p_last[1]), int(p_first[0]), int(p_first[1]))
+            
+            # 绘制多边形顶点（白色圆点，如果正在拖动则高亮）
+            for i, point in enumerate(polygon_to_draw):
+                if self._polygon_editing and i == self._polygon_drag_index:
+                    # 高亮正在拖动的顶点
+                    painter.setPen(QPen(QColor(0, 255, 0, 255), 3))
+                    painter.setBrush(QColor(0, 255, 0, 180))
+                else:
+                    painter.setPen(QPen(QColor(255, 255, 255, 255), 2))
+                    painter.setBrush(QColor(255, 255, 255, 180))
+                painter.drawEllipse(int(point[0] - 5), int(point[1] - 5), 10, 10)
+            
+            # 显示顶点数量提示（仅在多边形选择模式或有持久化多边形时显示）
+            if len(polygon_to_draw) > 0 and (self._polygon_selection_mode or self._persistent_polygon):
+                from PyQt5.QtGui import QFont
+                painter.setFont(QFont("Arial", 10))
+                painter.setPen(QColor(255, 167, 38))
+                first_point = polygon_to_draw[0]
+                status = "已完成" if self._persistent_polygon else "编辑中"
+                painter.drawText(int(first_point[0] + 10), int(first_point[1] - 10), 
+                               f"{len(polygon_to_draw)}/8 顶点 [{status}]")
 
     def resizeEvent(self, event):
         self._scaled_pixmap = None
@@ -304,6 +384,47 @@ class RenderView(QWidget):
         cx, cy = self.width() / 2, self.height() / 2
         r = min(self.width(), self.height()) / 2 * self._trackball_ratio
         return (pos.x() - cx) ** 2 + (pos.y() - cy) ** 2 < r * r
+    
+    def _calculate_rotation_pivot(self, mouse_pos):
+        """计算基于鼠标点击位置的旋转中心点（3D空间）
+        
+        通过射线投射到场景中心距离的球面来估算旋转中心
+        """
+        if not self._image_rect:
+            return None
+        
+        x0, y0, w, h = self._image_rect
+        if w <= 0 or h <= 0:
+            return None
+        
+        # 转换为归一化坐标 [-1, 1]
+        norm_x = 2.0 * (mouse_pos.x() - x0) / w - 1.0
+        norm_y = 2.0 * (mouse_pos.y() - y0) / h - 1.0
+        
+        # 使用相机FOV计算射线方向
+        import math
+        tan_fovx = math.tan(self.camera.FoVx * 0.5)
+        tan_fovy = math.tan(self.camera.FoVy * 0.5)
+        
+        # 相机坐标系中的射线方向
+        ray_cam = np.array([
+            norm_x * tan_fovx,
+            -norm_y * tan_fovy,  # Y向下
+            1.0  # 向前
+        ], dtype=np.float32)
+        ray_cam = ray_cam / np.linalg.norm(ray_cam)
+        
+        # 转换到世界坐标系
+        ray_world = self.camera.R @ ray_cam
+        
+        # 计算与场景中心距离的交点
+        to_center = self.camera.scene_center - self.camera.position
+        dist_to_center = np.linalg.norm(to_center)
+        
+        # 投影到射线上
+        pivot = self.camera.position + ray_world * dist_to_center
+        
+        return pivot
 
     def render_width(self):
         if self.camera:
@@ -349,6 +470,173 @@ class RenderView(QWidget):
             self._selection_update_timer.timeout.disconnect(self._delayed_selection_update)
         except:
             pass
+    
+    def _get_selection_rect_handles(self):
+        """获取固定框选矩形的控制点位置"""
+        if not self._image_rect or not self._persistent_selection_rect:
+            return {}
+        
+        x0, y0, w, h = self._image_rect
+        start_norm, end_norm = self._persistent_selection_rect
+        rx0 = x0 + min(start_norm[0], end_norm[0]) * w
+        ry0 = y0 + min(start_norm[1], end_norm[1]) * h
+        rw = abs(end_norm[0] - start_norm[0]) * w
+        rh = abs(end_norm[1] - start_norm[1]) * h
+        
+        rx1 = rx0 + rw
+        ry1 = ry0 + rh
+        cx = rx0 + rw / 2
+        cy = ry0 + rh / 2
+        
+        return {
+            'nw': (rx0, ry0),      # 左上
+            'n':  (cx, ry0),       # 上中
+            'ne': (rx1, ry0),      # 右上
+            'e':  (rx1, cy),       # 右中
+            'se': (rx1, ry1),      # 右下
+            's':  (cx, ry1),       # 下中
+            'sw': (rx0, ry1),      # 左下
+            'w':  (rx0, cy),       # 左中
+            'move': (cx, cy),      # 中心（移动）
+        }
+    
+    def _get_handle_at_pos(self, pos):
+        """检测鼠标位置是否在某个控制点上"""
+        handles = self._get_selection_rect_handles()
+        handle_size = 8
+        threshold = handle_size * 1.5  # 增加一些容差
+        
+        # 优先检测角点，然后边点，最后是中心移动
+        for name in ['nw', 'ne', 'se', 'sw', 'n', 'e', 's', 'w', 'move']:
+            if name not in handles:
+                continue
+            hx, hy = handles[name]
+            dist = ((pos.x() - hx) ** 2 + (pos.y() - hy) ** 2) ** 0.5
+            if dist <= threshold:
+                return name
+        return None
+    
+    def _get_cursor_for_handle(self, handle_name):
+        """根据控制点类型返回对应的光标"""
+        cursor_map = {
+            'nw': Qt.SizeFDiagCursor,
+            'ne': Qt.SizeBDiagCursor,
+            'se': Qt.SizeFDiagCursor,
+            'sw': Qt.SizeBDiagCursor,
+            'n':  Qt.SizeVerCursor,
+            's':  Qt.SizeVerCursor,
+            'e':  Qt.SizeHorCursor,
+            'w':  Qt.SizeHorCursor,
+            'move': Qt.SizeAllCursor,
+        }
+        return cursor_map.get(handle_name, Qt.ArrowCursor)
+    
+    def _update_selection_rect_by_handle(self, current_pos):
+        """根据拖拽的控制点更新固定框选矩形"""
+        if not self._persistent_selection_rect or not self._selection_rect_handle:
+            return
+        
+        if not self._image_rect:
+            return
+        
+        x0, y0, w, h = self._image_rect
+        start_norm, end_norm = self._persistent_selection_rect
+        
+        # 转换到像素坐标
+        rx0 = x0 + min(start_norm[0], end_norm[0]) * w
+        ry0 = y0 + min(start_norm[1], end_norm[1]) * h
+        rx1 = x0 + max(start_norm[0], end_norm[0]) * w
+        ry1 = y0 + max(start_norm[1], end_norm[1]) * h
+        
+        # 计算鼠标移动的偏移
+        dx = current_pos.x() - self._selection_rect_start_pos.x()
+        dy = current_pos.y() - self._selection_rect_start_pos.y()
+        
+        handle = self._selection_rect_handle
+        
+        # 根据控制点类型调整矩形
+        if handle == 'move':
+            # 移动整个矩形
+            rx0 += dx
+            ry0 += dy
+            rx1 += dx
+            ry1 += dy
+        elif handle == 'nw':
+            rx0 += dx
+            ry0 += dy
+        elif handle == 'ne':
+            rx1 += dx
+            ry0 += dy
+        elif handle == 'se':
+            rx1 += dx
+            ry1 += dy
+        elif handle == 'sw':
+            rx0 += dx
+            ry1 += dy
+        elif handle == 'n':
+            ry0 += dy
+        elif handle == 's':
+            ry1 += dy
+        elif handle == 'e':
+            rx1 += dx
+        elif handle == 'w':
+            rx0 += dx
+        
+        # 确保矩形不会翻转
+        if rx1 < rx0:
+            rx0, rx1 = rx1, rx0
+        if ry1 < ry0:
+            ry0, ry1 = ry1, ry0
+        
+        # 限制在图像范围内
+        rx0 = max(x0, min(x0 + w, rx0))
+        ry0 = max(y0, min(y0 + h, ry0))
+        rx1 = max(x0, min(x0 + w, rx1))
+        ry1 = max(y0, min(y0 + h, ry1))
+        
+        # 转换回归一化坐标
+        new_start_norm = ((rx0 - x0) / w, (ry0 - y0) / h)
+        new_end_norm = ((rx1 - x0) / w, (ry1 - y0) / h)
+        
+        # 更新固定框选矩形
+        self._persistent_selection_rect = (new_start_norm, new_end_norm)
+        
+        # 更新起始位置为当前位置
+        self._selection_rect_start_pos = current_pos
+        
+        # 触发选择回调（实时更新选择）
+        if self._selection_callback:
+            self._selection_callback("rect", "set", (new_start_norm, new_end_norm))
+    
+    def _complete_polygon_selection(self):
+        """完成多边形选择"""
+        if len(self._polygon_points) < 3:
+            if hasattr(self, '_toast'):
+                self._toast.show_message("多边形至少需要3个顶点", 1500)
+            return
+        
+        # 转换为归一化坐标
+        if not self._image_rect:
+            return
+        
+        x0, y0, w, h = self._image_rect
+        polygon_norm = []
+        for point in self._polygon_points:
+            norm_x = (point[0] - x0) / max(1.0, float(w))
+            norm_y = (point[1] - y0) / max(1.0, float(h))
+            polygon_norm.append((norm_x, norm_y))
+        
+        # 触发选择回调
+        if self._selection_callback:
+            op = self._selection_op(QApplication.keyboardModifiers())
+            self._selection_callback("polygon", op, polygon_norm)
+        
+        # 保存为持久化多边形（保持可见和可编辑）
+        self._persistent_polygon = list(self._polygon_points)
+        # 不清空 _polygon_points，保持可以继续编辑
+        self._polygon_editing = False
+        self._polygon_drag_index = -1
+        self.update()
 
     def _selection_op(self, modifiers):
         if modifiers & Qt.ShiftModifier:
@@ -366,6 +654,54 @@ class RenderView(QWidget):
             and self._selection_callback
             and self._point_inside_image(e.pos())
         ):
+            # 检查是否点击了持久化多边形的顶点（始终允许拖动）
+            if self._persistent_polygon and len(self._polygon_points) > 0:
+                clicked_vertex = self._get_polygon_vertex_at_pos(e.pos())
+                if clicked_vertex >= 0:
+                    self._polygon_editing = True
+                    self._polygon_drag_index = clicked_vertex
+                    self._polygon_drag_start = e.pos()
+                    e.accept()
+                    return
+            
+            # 多边形选择模式
+            if self._polygon_selection_mode:
+                # 检查是否点击了现有顶点（用于拖动编辑）
+                clicked_vertex = self._get_polygon_vertex_at_pos(e.pos())
+                if clicked_vertex >= 0:
+                    self._polygon_editing = True
+                    self._polygon_drag_index = clicked_vertex
+                    self._polygon_drag_start = e.pos()
+                    e.accept()
+                    return
+                
+                # 添加新顶点（最多8个）
+                if len(self._polygon_points) < 8:
+                    point = self._clamp_to_image_rect(e.pos())
+                    self._polygon_points.append(point)
+                    self.update()
+                    e.accept()
+                    return
+                else:
+                    # 已经8个点，提示用户右键完成
+                    if hasattr(self, '_toast'):
+                        self._toast.show_message("多边形已达8个顶点上限，可拖动编辑或右键完成", 1500)
+                    e.accept()
+                    return
+            
+            # 检查是否点击了固定框选矩形的控制点
+            if self._persistent_selection_rect:
+                handle = self._get_handle_at_pos(e.pos())
+                if handle:
+                    # 进入编辑模式
+                    self._editing_selection_rect = True
+                    self._selection_rect_handle = handle
+                    self._selection_rect_start_pos = e.pos()
+                    self.setFocus()
+                    e.accept()
+                    return
+            
+            # 否则开始新的框选
             self._selection_drag = True
             self._selection_start = self._clamp_to_image_rect(e.pos())
             self._selection_current = self._selection_start
@@ -375,21 +711,26 @@ class RenderView(QWidget):
             self.update()
             e.accept()
             return
+        
+        # 多边形模式下，右键完成多边形
+        if self._polygon_selection_mode and e.button() == Qt.RightButton:
+            if len(self._polygon_points) >= 3:
+                self._complete_polygon_selection()
+                if hasattr(self, '_toast'):
+                    self._toast.show_message(f"多边形已完成（{len(self._polygon_points)}个顶点）- 可继续拖动顶点编辑", 2000)
+            else:
+                self._polygon_points = []
+                self._persistent_polygon = None
+                if hasattr(self, '_toast'):
+                    self._toast.show_message("多边形已取消（需要至少3个顶点）", 1500)
+                self.update()
+            e.accept()
+            return
         b = e.button()
-        if   b == Qt.LeftButton:
+        if   b == Qt.LeftButton:   
             self._left  = True
-            # 尝试拾取鼠标位置的3D点作为旋转中心
-            if self._point_inside_image(e.pos()) and hasattr(self, 'renderer') and self.renderer:
-                norm_pos = self._widget_point_to_norm((e.pos().x(), e.pos().y()))
-                if norm_pos:
-                    picked_idx = self.renderer.pick_point(self.camera, norm_pos[0], norm_pos[1])
-                    if picked_idx is not None and hasattr(self.renderer.pc, 'get_xyz'):
-                        xyz = self.renderer.pc.get_xyz
-                        if xyz is not None and picked_idx < xyz.shape[0]:
-                            self._rotation_pivot = xyz[picked_idx].detach().cpu().numpy()
-                            # 更新相机的旋转中心
-                            if hasattr(self.camera, 'set_rotation_pivot'):
-                                self.camera.set_rotation_pivot(self._rotation_pivot)
+            # 记录旋转起始位置
+            self._rotation_start_pos = e.pos()
         elif b == Qt.RightButton:  self._right = True
         elif b == Qt.MiddleButton: self._mid   = True
         self._last_pos = e.pos()
@@ -397,7 +738,45 @@ class RenderView(QWidget):
         if self._interaction_callback:
             self._interaction_callback()
 
+    def _get_polygon_vertex_at_pos(self, pos):
+        """检查鼠标位置是否在多边形顶点附近，返回顶点索引，-1表示不在"""
+        if not self._polygon_points:
+            return -1
+        
+        click_threshold = 10  # 像素距离阈值
+        for i, vertex in enumerate(self._polygon_points):
+            dx = pos.x() - vertex[0]
+            dy = pos.y() - vertex[1]
+            dist = (dx*dx + dy*dy) ** 0.5
+            if dist < click_threshold:
+                return i
+        return -1
+    
     def mouseReleaseEvent(self, e):
+        if self._polygon_editing and e.button() == Qt.LeftButton:
+            # 结束多边形顶点拖动，触发选择更新
+            self._polygon_editing = False
+            self._polygon_drag_index = -1
+            self._polygon_drag_start = None
+            
+            # 如果是持久化多边形，拖动后需要重新触发选择
+            if self._persistent_polygon and len(self._polygon_points) >= 3:
+                self._complete_polygon_selection()
+            
+            self.update()
+            e.accept()
+            return
+        
+        if self._editing_selection_rect and e.button() == Qt.LeftButton:
+            # 结束编辑模式
+            self._editing_selection_rect = False
+            self._selection_rect_handle = None
+            self._selection_rect_start_pos = None
+            self.setCursor(Qt.CrossCursor)
+            self.update()
+            e.accept()
+            return
+        
         if self._selection_drag and e.button() == Qt.LeftButton:
             start = self._selection_start
             end = self._clamp_to_image_rect(e.pos()) or self._selection_current
@@ -425,12 +804,13 @@ class RenderView(QWidget):
             e.accept()
             return
         b = e.button()
-        if   b == Qt.LeftButton:
+        if   b == Qt.LeftButton:   
             self._left  = False
-            # 释放左键时清除旋转中心
-            self._rotation_pivot = None
-            if hasattr(self.camera, 'clear_rotation_pivot'):
-                self.camera.clear_rotation_pivot()
+            # 清除旋转中心缓存
+            if hasattr(self, '_rotation_pivot'):
+                delattr(self, '_rotation_pivot')
+            if hasattr(self, '_rotation_start_pos'):
+                delattr(self, '_rotation_start_pos')
         elif b == Qt.RightButton:  self._right = False
         elif b == Qt.MiddleButton: self._mid   = False
         if not (self._left or self._right or self._mid):
@@ -439,6 +819,30 @@ class RenderView(QWidget):
             self._interaction_callback()
 
     def mouseMoveEvent(self, e):
+        # 拖动多边形顶点（最高优先级）
+        if self._polygon_editing and self._polygon_drag_index >= 0:
+            new_pos = self._clamp_to_image_rect(e.pos())
+            if new_pos and 0 <= self._polygon_drag_index < len(self._polygon_points):
+                self._polygon_points[self._polygon_drag_index] = new_pos
+                self.update()
+            e.accept()
+            return
+        
+        # 处理框选编辑
+        if self._editing_selection_rect:
+            self._update_selection_rect_by_handle(e.pos())
+            self.update()
+            e.accept()
+            return
+        
+        # 更新光标（在选择模式下）
+        if self._selection_mode and self._persistent_selection_rect and not self._selection_drag:
+            handle = self._get_handle_at_pos(e.pos())
+            if handle:
+                self.setCursor(self._get_cursor_for_handle(handle))
+            else:
+                self.setCursor(Qt.CrossCursor)
+        
         if self._selection_drag:
             self._selection_current = self._clamp_to_image_rect(e.pos()) or self._selection_current
             # 使用节流机制避免过度重绘
@@ -462,12 +866,22 @@ class RenderView(QWidget):
                 if ic: self.camera.trackball_pan(-dx, dy)
                 else:  self.camera.trackball_zoom(-dy * 0.5)
         else:
-            # FPS / Orbit 模式: 左键旋转, 右键平移(抓取式), 中键前后
+            # FPS / Orbit 模式: 左键旋转(围绕鼠标点击位置), 右键平移(抓取式), 中键前后
             if self._left:
-                # 如果有自定义旋转中心，使用orbit旋转；否则原地旋转
-                if self._rotation_pivot is not None and hasattr(self.camera, 'orbit_rotate'):
-                    self.camera.orbit_rotate(dx, dy)
+                # 计算旋转中心（基于初始点击位置）
+                if hasattr(self, '_rotation_pivot'):
+                    # 使用存储的旋转中心
+                    pivot = self._rotation_pivot
                 else:
+                    # 首次旋转，计算旋转中心
+                    pivot = self._calculate_rotation_pivot(self._rotation_start_pos if hasattr(self, '_rotation_start_pos') else e.pos())
+                    self._rotation_pivot = pivot
+                
+                # 围绕旋转中心旋转：向右拖动dx>0→向右看，向上拖动dy<0→向上看
+                if pivot is not None:
+                    self.camera.rotate_around_point(pivot, dx * 0.3, -dy * 0.3)
+                else:
+                    # 如果无法计算旋转中心，使用默认旋转
                     self.camera.rotate_yaw(dx * 0.3)
                     self.camera.rotate_pitch(-dy * 0.3)
             if self._right:
@@ -555,6 +969,9 @@ class MainWindow(QMainWindow):
 
         # Sync initial state
         self._sync_initial_state()
+        
+        # Hide left panel initially
+        self._set_left_panel_visible(False)
 
         # ── Timers ──
         self._render_timer = QTimer(self)
@@ -585,7 +1002,7 @@ class MainWindow(QMainWindow):
         fm.addAction(a)
 
         em = mb.addMenu("编辑(&E)")
-        a = QAction("选择模式 (&V)", self); a.setShortcut("V"); a.triggered.connect(self._toggle_selection_mode)
+        a = QAction("选择模式 (&V)", self); a.triggered.connect(self._toggle_selection_mode)
         em.addAction(a)
         em.addSeparator()
         a = QAction("全选", self); a.setShortcut("Ctrl+A"); a.triggered.connect(self._select_all)
@@ -595,6 +1012,9 @@ class MainWindow(QMainWindow):
         a = QAction("清除持续框", self); a.setShortcut("Shift+C"); a.triggered.connect(self._clear_selection_reference)
         em.addAction(a)
         a = QAction("反选", self); a.setShortcut("Ctrl+I"); a.triggered.connect(self._invert_selection)
+        em.addAction(a)
+        em.addSeparator()
+        a = QAction("多边形选择 (X)", self); a.triggered.connect(self._toggle_polygon_selection)
         em.addAction(a)
         em.addSeparator()
         a = QAction("隐藏选中", self); a.triggered.connect(self._hide_selected)
@@ -764,6 +1184,7 @@ class MainWindow(QMainWindow):
         self.left_panel.rot_speed_changed.connect(self._on_rot_speed_changed)
         self.left_panel.reset_camera_clicked.connect(self._reset_camera)
         self.left_panel.selection_mode_toggled.connect(self._set_selection_mode)
+        self.left_panel.polygon_selection_toggled.connect(self._on_polygon_selection_toggled)
         self.left_panel.select_all_clicked.connect(self._select_all)
         self.left_panel.clear_selection_clicked.connect(self._clear_selection)
         self.left_panel.clear_selection_rect_clicked.connect(self._clear_selection_reference)
@@ -825,6 +1246,7 @@ class MainWindow(QMainWindow):
         self._register_shortcut(Qt.Key_P, self._snap_to_nearest_camera)
         self._register_shortcut(Qt.Key_R, self._reset_camera)
         self._register_shortcut(Qt.Key_V, self._toggle_selection_mode)
+        self._register_shortcut(Qt.Key_X, self._toggle_polygon_selection)
         self._register_shortcut("Ctrl+A", self._select_all)
         self._register_shortcut("Ctrl+Shift+A", self._clear_selection)
         self._register_shortcut("Shift+C", self._clear_selection_reference)
@@ -1255,6 +1677,10 @@ class MainWindow(QMainWindow):
         enabled = bool(enabled)
         if not enabled:
             self._clear_selection_reference(quiet=True)
+            # 关闭选择模式时，同时关闭多边形选择
+            self.left_panel.polygon_selection_btn.blockSignals(True)
+            self.left_panel.polygon_selection_btn.setChecked(False)
+            self.left_panel.polygon_selection_btn.blockSignals(False)
         self.ui_state.selection_mode = enabled
         self.left_panel.sync_selection_mode(enabled)
         self.overlay.set_selection_mode(enabled)
@@ -1269,6 +1695,40 @@ class MainWindow(QMainWindow):
 
     def _toggle_selection_mode(self):
         self._set_selection_mode(not self.ui_state.selection_mode)
+    
+    def _on_polygon_selection_toggled(self, enabled: bool):
+        """处理左侧面板的多边形选择按钮"""
+        if not self.ui_state.selection_mode:
+            # 如果选择模式未启用，先启用它
+            self._set_selection_mode(True)
+        
+        # 设置多边形选择模式
+        is_polygon = self.view._polygon_selection_mode
+        if enabled and not is_polygon:
+            self.view.toggle_polygon_selection()
+            self.toast.show_message("多边形选择模式：左键添加点，右键完成", 2500)
+        elif not enabled and is_polygon:
+            self.view.toggle_polygon_selection()
+            self.toast.show_message("已退出多边形选择模式", 1500)
+        self._request_render()
+    
+    def _toggle_polygon_selection(self):
+        """切换多边形选择模式（热键L）"""
+        if not self.ui_state.selection_mode:
+            self.toast.show_message("请先启用选择模式 (V键)", 1500)
+            return
+        
+        is_polygon = self.view.toggle_polygon_selection()
+        # 同步按钮状态
+        self.left_panel.polygon_selection_btn.blockSignals(True)
+        self.left_panel.polygon_selection_btn.setChecked(is_polygon)
+        self.left_panel.polygon_selection_btn.blockSignals(False)
+        
+        if is_polygon:
+            self.toast.show_message("多边形选择模式：左键添加点（最多8个），右键完成", 2500)
+        else:
+            self.toast.show_message("已退出多边形选择模式（完成的多边形仍可拖动编辑）", 2000)
+        self._request_render()
 
     def _selection_summary_text(self):
         return (
@@ -1288,24 +1748,44 @@ class MainWindow(QMainWindow):
             idx = self.renderer.pick_point(self.camera, payload[0], payload[1])
             indices = [] if idx is None else [idx]
             action_label = "点选"
+            extra = ""
+        elif kind == "polygon":
+            self._clear_sticky_rect_selection()
+            if hasattr(self.renderer, 'pick_polygon'):
+                indices = self.renderer.pick_polygon(self.camera, payload)
+            else:
+                indices = []
+            action_label = "多边形选择"
+            extra = ""
         else:
             start_norm, end_norm = payload
             self._set_sticky_rect_selection((start_norm, end_norm), op=op)
             indices = self.renderer.pick_rect(self.camera, start_norm, end_norm)
             action_label = "框选"
+            extra = " · 已记住框区域并在换帧时自动沿用"
         self.pc.apply_selection_indices(indices, op=op)
         op_label = {"set": "设置", "add": "添加", "remove": "移除"}.get(op, op)
-        extra = " · 已记住框区域并在换帧时自动沿用" if kind == "rect" else ""
         self._apply_selection_feedback(f"{action_label}{op_label}{extra}")
 
     def _clear_selection(self):
         self._clear_sticky_rect_selection()
+        # 清空多边形持久化状态
+        if hasattr(self.view, '_persistent_polygon'):
+            self.view._persistent_polygon = None
+            self.view._polygon_points = []
+            self.view.update()
         self.pc.clear_selection()
         self._apply_selection_feedback("清空选择")
 
     def _clear_selection_reference(self, quiet=False):
         had_rect = bool(self._sticky_rect_selection)
         self._clear_sticky_rect_selection()
+        # 清空多边形持久化状态
+        if hasattr(self.view, '_persistent_polygon') and self.view._persistent_polygon:
+            self.view._persistent_polygon = None
+            self.view._polygon_points = []
+            self.view.update()
+            had_rect = True  # 有需要清除的内容
         if quiet:
             return
         if had_rect:
@@ -1342,6 +1822,7 @@ class MainWindow(QMainWindow):
         if count <= 0:
             self.toast.show_message("当前没有可删除的选中高斯", 1500)
             return
+        self._clear_selection_reference(quiet=True)
         self._apply_selection_feedback(f"已删除 {count} 个高斯")
 
     def _delete_unselected(self):
@@ -1350,6 +1831,7 @@ class MainWindow(QMainWindow):
         if count <= 0:
             self.toast.show_message("当前没有可删除的未选中高斯", 1500)
             return
+        self._clear_selection_reference(quiet=True)
         self._apply_selection_feedback(f"已反向删除 {count} 个高斯（保留选中）")
 
     def _restore_deleted(self):
@@ -1652,6 +2134,7 @@ class MainWindow(QMainWindow):
 <b>高斯选择 / 编辑</b><br>
 &nbsp;&nbsp;<b>V</b> — 开关选择模式<br>
 &nbsp;&nbsp;<b>左键单击</b> — 点选高斯 &nbsp; <b>左键拖拽</b> — 框选高斯<br>
+&nbsp;&nbsp;<b>L</b> — 多边形选择（左键添加点，右键完成）<br>
 &nbsp;&nbsp;框选区域会在换帧时自动沿用；点选 / 全选 / 清空 / 反选会取消沿用<br>
 &nbsp;&nbsp;<b>Shift</b> — 添加到选择 &nbsp; <b>Ctrl</b> — 从选择中移除<br>
 &nbsp;&nbsp;<b>框选时按Shift/Ctrl</b> 可在拖拽中修正操作模式<br>

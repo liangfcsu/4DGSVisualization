@@ -29,3 +29,5 @@ submodules/*/*.egg-info/
 submodules/*/dist/
 
 supersplat
+
+gaussian-splatting
