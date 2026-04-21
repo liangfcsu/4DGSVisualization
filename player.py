@@ -92,7 +92,7 @@ from ui.state import (
     VISUALIZATION_MODES, VIS_TO_RENDER_MODE,
     CAMERA_MODES,
 )
-from ui.style import GLOBAL_QSS, build_qss, F_CAPTION
+from ui.style import build_qss, F_CAPTION
 from ui.top_bar import TopBar
 from ui.left_panel import LeftControlPanel
 from ui.right_panel import RightInfoPanel
@@ -3021,12 +3021,6 @@ def main():
     parser.add_argument("--point-opacity", type=float, default=1.0)
 
     args = parser.parse_args()
-
-    # 不再强制要求输入文件，允许空白启动
-    # if args.input is None and args.model_path is None:
-    #     parser.print_help()
-    #     print("\n错误: 请指定序列目录或 PLY 文件")
-    #     sys.exit(1)
 
     app = QApplication(sys.argv)
     app.setApplicationName("4DGS Viewer")
