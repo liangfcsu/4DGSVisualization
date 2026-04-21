@@ -3220,6 +3220,9 @@ class GaussianRenderer:
         self.point_size = 1.0
         self.point_opacity = 1.0
         self.ring_size = 0.3
+        # 添加投影缓存以优化框选性能
+        self._projection_cache = None
+        self._projection_cache_key = None
 
     def _device(self):
         xyz = self.pc.get_xyz
@@ -3351,6 +3354,22 @@ class GaussianRenderer:
         if xyz is None or xyz.numel() == 0:
             return None
 
+        # 生成缓存键（仅在indices为None时缓存，即全量投影）
+        if indices is None:
+            cache_key = (
+                id(camera),
+                tuple(camera.position),
+                tuple(camera.R.flatten().tolist()),
+                camera.width,
+                camera.height,
+                camera.FoVx,
+                camera.FoVy,
+                self.pc.edit_state_version,  # 使用点云状态版本
+            )
+            # 检查缓存
+            if self._projection_cache_key == cache_key:
+                return self._projection_cache
+
         device = xyz.device
         if indices is None:
             base_indices = torch.arange(xyz.shape[0], device=device, dtype=torch.long)
@@ -3393,13 +3412,20 @@ class GaussianRenderer:
         valid &= screen_y >= 0.0
         valid &= screen_y <= float(camera.height)
 
-        return {
+        result = {
             "indices": base_indices,
             "screen_x": screen_x,
             "screen_y": screen_y,
             "depth": cam_z,
             "valid": valid,
         }
+        
+        # 缓存全量投影结果
+        if indices is None:
+            self._projection_cache = result
+            self._projection_cache_key = cache_key
+        
+        return result
 
     def pick_point(self, camera, norm_x, norm_y, min_pick_radius=6.0, fallback_radius=14.0):
         with torch.inference_mode():

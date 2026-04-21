@@ -174,8 +174,13 @@ class RenderView(QWidget):
         self._selection_drag = False
         self._selection_start = None
         self._selection_current = None
+        self._selection_modifier_mode = None  # 记录框选时的修饰键模式
         self._selection_overlay_points = []
         self._persistent_selection_rect = None
+        self._selection_update_timer = QTimer()
+        self._selection_update_timer.setSingleShot(True)
+        self._selection_update_timer.setInterval(16)  # ~60fps
+        self._selection_pending_update = False
 
         # Overlay references (set by MainWindow)
         self._overlay = None
@@ -195,6 +200,7 @@ class RenderView(QWidget):
         self._selection_drag = False
         self._selection_start = None
         self._selection_current = None
+        self._selection_modifier_mode = None
         self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
         self.update()
 
@@ -332,6 +338,16 @@ class RenderView(QWidget):
             (py - y0) / max(1.0, float(h)),
         )
 
+    def _delayed_selection_update(self):
+        """延迟更新选择框，降低重绘频率"""
+        self._selection_pending_update = False
+        self.update()
+        # 断开信号避免重复连接
+        try:
+            self._selection_update_timer.timeout.disconnect(self._delayed_selection_update)
+        except:
+            pass
+
     def _selection_op(self, modifiers):
         if modifiers & Qt.ShiftModifier:
             return "add"
@@ -351,6 +367,7 @@ class RenderView(QWidget):
             self._selection_drag = True
             self._selection_start = self._clamp_to_image_rect(e.pos())
             self._selection_current = self._selection_start
+            self._selection_modifier_mode = self._selection_op(e.modifiers())  # 记录修饰键
             self._last_pos = None
             self.setFocus()
             self.update()
@@ -369,14 +386,18 @@ class RenderView(QWidget):
         if self._selection_drag and e.button() == Qt.LeftButton:
             start = self._selection_start
             end = self._clamp_to_image_rect(e.pos()) or self._selection_current
+            # 检测修饰键是否改变（支持框选过程中修改操作模式）
+            current_op = self._selection_op(e.modifiers())
+            op = current_op if current_op != "set" else self._selection_modifier_mode
+            
             self._selection_drag = False
             self._selection_start = None
             self._selection_current = None
+            self._selection_modifier_mode = None
             self.update()
             if start and end and self._selection_callback:
                 dx = end[0] - start[0]
                 dy = end[1] - start[1]
-                op = self._selection_op(e.modifiers())
                 if abs(dx) < 4 and abs(dy) < 4:
                     point_norm = self._widget_point_to_norm(end)
                     if point_norm is not None:
@@ -400,7 +421,11 @@ class RenderView(QWidget):
     def mouseMoveEvent(self, e):
         if self._selection_drag:
             self._selection_current = self._clamp_to_image_rect(e.pos()) or self._selection_current
-            self.update()
+            # 使用节流机制避免过度重绘
+            if not self._selection_pending_update:
+                self._selection_pending_update = True
+                self._selection_update_timer.timeout.connect(self._delayed_selection_update)
+                self._selection_update_timer.start()
             e.accept()
             return
         if not self.camera or self._last_pos is None:
@@ -528,6 +553,9 @@ class MainWindow(QMainWindow):
         fm.addAction(a)
         a = QAction("导出当前编辑帧 PLY", self); a.triggered.connect(self._export_current_frame_ply)
         fm.addAction(a)
+        if self.seq:
+            a = QAction("导出序列 PLY", self); a.triggered.connect(self._export_sequence_ply)
+            fm.addAction(a)
         fm.addSeparator()
         a = QAction("退出 (&Q)", self); a.setShortcut("Ctrl+Q"); a.triggered.connect(self.close)
         fm.addAction(a)
@@ -549,7 +577,7 @@ class MainWindow(QMainWindow):
         em.addAction(a)
         a = QAction("恢复隐藏", self); a.setShortcut("Shift+U"); a.triggered.connect(self._unhide_all)
         em.addAction(a)
-        a = QAction("删除选中", self); a.setShortcuts(["Delete", "Del", "Backspace"]); a.triggered.connect(self._delete_selected)
+        a = QAction("删除选中", self); a.setShortcut("Del"); a.triggered.connect(self._delete_selected)
         em.addAction(a)
         a = QAction("恢复删除", self); a.setShortcut("Shift+R"); a.triggered.connect(self._restore_deleted)
         em.addAction(a)
@@ -775,9 +803,7 @@ class MainWindow(QMainWindow):
         self._register_shortcut("Ctrl+I", self._invert_selection)
         self._register_shortcut("Shift+H", self._hide_selected)
         self._register_shortcut("Shift+U", self._unhide_all)
-        self._register_shortcut("Delete", self._delete_selected)
         self._register_shortcut("Del", self._delete_selected)
-        self._register_shortcut("Backspace", self._delete_selected)
         self._register_shortcut("Shift+R", self._restore_deleted)
         self._register_shortcut(Qt.Key_Tab, self._toggle_panels)
         self._register_shortcut(Qt.Key_H, self._toggle_hud)
@@ -1426,6 +1452,102 @@ class MainWindow(QMainWindow):
         self._set_last_event(f"导出PLY: {os.path.basename(file_path)}")
         self.toast.show_message(f"已导出编辑后的 PLY: {os.path.basename(file_path)}", 2500)
 
+    def _export_sequence_ply(self):
+        if not self.seq:
+            QMessageBox.warning(self, "导出失败", "当前不是序列模式")
+            return
+        
+        scene_base = self._scene_name().replace(os.sep, "_")
+        default_dir = f"{scene_base}_edited_sequence"
+        output_dir = QFileDialog.getExistingDirectory(
+            self,
+            "选择导出序列的目录",
+            default_dir,
+        )
+        if not output_dir:
+            return
+        
+        # 创建输出目录
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 记录当前帧
+        original_frame = self.seq.current_frame
+        
+        # 显示进度对话框
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import Qt
+        progress = QProgressDialog(
+            "正在导出序列...",
+            "取消",
+            0,
+            self.seq.num_frames,
+            self
+        )
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setWindowTitle("导出序列 PLY")
+        progress.setMinimumDuration(0)
+        
+        try:
+            exported_count = 0
+            failed_frames = []
+            
+            for frame_idx in range(self.seq.num_frames):
+                if progress.wasCanceled():
+                    break
+                
+                progress.setValue(frame_idx)
+                progress.setLabelText(f"正在导出第 {frame_idx + 1}/{self.seq.num_frames} 帧...")
+                QApplication.processEvents()
+                
+                try:
+                    # 切换到目标帧
+                    self.seq.current_frame = frame_idx
+                    self._reload()
+                    
+                    # 生成输出文件名（保持原始文件名或使用帧编号）
+                    frame_filename = self.seq.frame_files[frame_idx]
+                    output_path = os.path.join(output_dir, frame_filename)
+                    
+                    # 导出当前帧
+                    self.pc.export_current_ply(output_path)
+                    exported_count += 1
+                    
+                except Exception as exc:
+                    failed_frames.append((frame_idx, str(exc)))
+            
+            progress.setValue(self.seq.num_frames)
+            
+            # 恢复原始帧
+            self.seq.current_frame = original_frame
+            self._reload()
+            
+            # 显示结果
+            if failed_frames:
+                failed_list = "\n".join([f"帧 {idx}: {err}" for idx, err in failed_frames[:5]])
+                if len(failed_frames) > 5:
+                    failed_list += f"\n... 还有 {len(failed_frames) - 5} 个错误"
+                QMessageBox.warning(
+                    self,
+                    "导出部分完成",
+                    f"成功导出 {exported_count}/{self.seq.num_frames} 帧到:\n{output_dir}\n\n失败的帧:\n{failed_list}"
+                )
+            else:
+                self._set_last_event(f"导出序列: {exported_count} 帧")
+                self.toast.show_message(f"已导出 {exported_count} 帧到: {os.path.basename(output_dir)}", 3000)
+                QMessageBox.information(
+                    self,
+                    "导出成功",
+                    f"成功导出 {exported_count} 帧到:\n{output_dir}"
+                )
+                
+        except Exception as exc:
+            # 恢复原始帧
+            self.seq.current_frame = original_frame
+            self._reload()
+            QMessageBox.critical(self, "导出失败", f"导出序列时发生错误:\n{exc}")
+        finally:
+            progress.close()
+
     # ═══════════════════════════════════════════════════════════════════════
     # Helpers
     # ═══════════════════════════════════════════════════════════════════════
@@ -1495,8 +1617,9 @@ class MainWindow(QMainWindow):
 &nbsp;&nbsp;<b>左键单击</b> — 点选高斯 &nbsp; <b>左键拖拽</b> — 框选高斯<br>
 &nbsp;&nbsp;框选区域会在换帧时自动沿用；点选 / 全选 / 清空 / 反选会取消沿用<br>
 &nbsp;&nbsp;<b>Shift</b> — 添加到选择 &nbsp; <b>Ctrl</b> — 从选择中移除<br>
+&nbsp;&nbsp;<b>框选时按Shift/Ctrl</b> 可在拖拽中修正操作模式<br>
 &nbsp;&nbsp;<b>Ctrl+A</b> — 全选 &nbsp; <b>Ctrl+Shift+A</b> — 清空选择 &nbsp; <b>Ctrl+I</b> — 反选<br>
-&nbsp;&nbsp;<b>Delete/Del</b> — 删除选中 &nbsp; <b>Shift+C</b> — 清除持续框 &nbsp; <b>Shift+H</b> — 隐藏选中<br>
+&nbsp;&nbsp;<b>Del</b> — 删除选中 &nbsp; <b>Shift+C</b> — 清除持续框 &nbsp; <b>Shift+H</b> — 隐藏选中<br>
 &nbsp;&nbsp;<b>Shift+U</b> — 恢复隐藏 &nbsp; <b>Shift+R</b> — 恢复删除<br><br>
 
 <b>相机移动</b><br>
