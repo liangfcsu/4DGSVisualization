@@ -2196,6 +2196,9 @@ class GaussianPointCloud:
     STATE_SELECTED = np.uint8(1)
     STATE_HIDDEN = np.uint8(2)
     STATE_DELETED = np.uint8(4)
+    VOXEL_HASH_P1 = np.int64(73856093)
+    VOXEL_HASH_P2 = np.int64(19349663)
+    VOXEL_HASH_P3 = np.int64(83492791)
 
     def __init__(self, ply_path, sh_degree=3, device="cuda", max_gaussians=None):
         self.device = device
@@ -2238,6 +2241,12 @@ class GaussianPointCloud:
         self._edit_state = None
         self._edit_state_key = None
         self._edit_state_store = {}
+        self._deleted_voxel_hashes = np.empty((0,), dtype=np.int64)
+        self._deleted_voxel_size = None
+        self._deleted_voxel_hashes_torch = None
+        self._deleted_voxel_hashes_torch_device = None
+        self._cached_visible_count = 0
+        self._cached_deleted_count = 0
         self._edit_state_version = 0
 
     def _buffer_device(self):
@@ -2334,9 +2343,18 @@ class GaussianPointCloud:
             self._edit_state_version += 1
 
     def _visible_mask(self):
-        if self._edit_state is None:
+        if self._point_count <= 0:
             return np.zeros((0,), dtype=bool)
-        return (self._edit_state & (self.STATE_HIDDEN | self.STATE_DELETED)) == 0
+        if self._edit_state is None or self._edit_state.shape[0] != self._point_count:
+            masked = np.zeros((self._point_count,), dtype=bool)
+        else:
+            masked = (self._edit_state & (self.STATE_HIDDEN | self.STATE_DELETED)) != 0
+        if self._deleted_voxel_hashes.size == 0:
+            return ~masked
+        transfer_deleted = self._deleted_transfer_mask_torch(device=torch.device("cpu"))
+        if transfer_deleted.numel() == 0:
+            return ~masked
+        return ~(masked | transfer_deleted.detach().cpu().numpy())
 
     def _ensure_masked_opacity_buffer(self):
         if self._source_opacity is None or self._point_count <= 0:
@@ -2359,25 +2377,183 @@ class GaussianPointCloud:
             return np.zeros((0,), dtype=bool)
         return (self._edit_state & self.STATE_SELECTED) != 0
 
+    def _hash_voxel_coords_np(self, coords):
+        coords = np.asarray(coords, dtype=np.int64)
+        return (
+            coords[:, 0] * self.VOXEL_HASH_P1
+            ^ coords[:, 1] * self.VOXEL_HASH_P2
+            ^ coords[:, 2] * self.VOXEL_HASH_P3
+        ).astype(np.int64, copy=False)
+
+    def _hash_voxel_coords_torch(self, coords):
+        coords = coords.to(dtype=torch.int64)
+        return (
+            coords[:, 0] * int(self.VOXEL_HASH_P1)
+            ^ coords[:, 1] * int(self.VOXEL_HASH_P2)
+            ^ coords[:, 2] * int(self.VOXEL_HASH_P3)
+        )
+
+    def _resolve_deleted_voxel_size(self, scales_np=None):
+        floor_size = max(float(self.scene_extent) * 0.001, 1e-4)
+        if self._deleted_voxel_size is not None:
+            return float(self._deleted_voxel_size)
+        if scales_np is None or scales_np.size == 0:
+            self._deleted_voxel_size = floor_size
+            return self._deleted_voxel_size
+        max_scale = np.max(scales_np, axis=1)
+        median_scale = float(np.median(max_scale)) if max_scale.size > 0 else floor_size
+        self._deleted_voxel_size = max(floor_size, median_scale * 1.5)
+        return self._deleted_voxel_size
+
+    def _deleted_transfer_mask_torch(self, indices=None, device=None):
+        if self._xyz is None or self._point_count <= 0 or self._deleted_voxel_hashes.size == 0:
+            if indices is None:
+                length = self._point_count
+            elif isinstance(indices, torch.Tensor):
+                length = int(indices.numel())
+            else:
+                length = int(len(indices))
+            target_device = device or self._buffer_device()
+            return torch.zeros((length,), dtype=torch.bool, device=target_device)
+
+        if device is None:
+            device = self._xyz.device
+
+        if (
+            self._deleted_voxel_hashes_torch is None
+            or self._deleted_voxel_hashes_torch_device != device
+        ):
+            self._deleted_voxel_hashes_torch = torch.from_numpy(self._deleted_voxel_hashes)
+            if str(device) != "cpu":
+                self._deleted_voxel_hashes_torch = self._deleted_voxel_hashes_torch.to(device=device, non_blocking=True)
+            self._deleted_voxel_hashes_torch_device = device
+
+        if indices is None:
+            xyz = self._xyz
+        else:
+            gather_idx = indices.to(device=self._xyz.device, dtype=torch.long) if isinstance(indices, torch.Tensor) else torch.as_tensor(indices, device=self._xyz.device, dtype=torch.long)
+            if gather_idx.numel() == 0:
+                return torch.zeros((0,), dtype=torch.bool, device=device)
+            xyz = self._xyz.index_select(0, gather_idx)
+
+        coords = torch.round(xyz / float(self._deleted_voxel_size)).to(dtype=torch.int64)
+        hashes = self._hash_voxel_coords_torch(coords)
+        if hashes.device != device:
+            hashes = hashes.to(device=device)
+        return torch.isin(hashes, self._deleted_voxel_hashes_torch)
+
+    def get_visible_mask_torch(self, indices=None, device=None):
+        if device is None:
+            device = self._buffer_device()
+        if indices is None:
+            length = self._point_count
+        elif isinstance(indices, torch.Tensor):
+            length = int(indices.numel())
+        else:
+            length = int(len(indices))
+        if length <= 0:
+            return torch.zeros((0,), dtype=torch.bool, device=device)
+
+        if self._edit_state is None or self._edit_state.shape[0] != self._point_count:
+            hidden_mask = torch.zeros((length,), dtype=torch.bool, device=device)
+            local_deleted_mask = torch.zeros((length,), dtype=torch.bool, device=device)
+        else:
+            state = torch.from_numpy(self._edit_state)
+            if str(device) != "cpu":
+                state = state.to(device=device, non_blocking=True)
+            if indices is not None:
+                gather_idx = indices.to(device=device, dtype=torch.long) if isinstance(indices, torch.Tensor) else torch.as_tensor(indices, device=device, dtype=torch.long)
+                state = state.index_select(0, gather_idx)
+            hidden_mask = (state & self.STATE_HIDDEN) != 0
+            local_deleted_mask = (state & self.STATE_DELETED) != 0
+        transfer_deleted_mask = self._deleted_transfer_mask_torch(indices=indices, device=device)
+        return ~(hidden_mask | local_deleted_mask | transfer_deleted_mask)
+
+    def _accumulate_deleted_transfer_from_indices(self, indices):
+        indices = self._sanitize_indices(indices)
+        if indices.size == 0 or self._xyz is None or self._scaling is None:
+            return 0
+
+        xyz_np = self._xyz.index_select(
+            0, torch.as_tensor(indices, device=self._xyz.device, dtype=torch.long)
+        ).detach().cpu().numpy()
+        scaling_np = self._scaling.index_select(
+            0, torch.as_tensor(indices, device=self._scaling.device, dtype=torch.long)
+        ).detach().cpu().numpy()
+
+        voxel_size = self._resolve_deleted_voxel_size(scaling_np)
+        coords = np.rint(xyz_np / voxel_size).astype(np.int64, copy=False)
+        cell_radius = np.clip(
+            np.ceil(np.max(scaling_np, axis=1) / voxel_size).astype(np.int64),
+            0,
+            1,
+        )
+
+        hashed_chunks = []
+        unique_radii = np.unique(cell_radius)
+        for radius in unique_radii:
+            subset = coords[cell_radius == radius]
+            if subset.size == 0:
+                continue
+            if radius <= 0:
+                hashed_chunks.append(self._hash_voxel_coords_np(subset))
+                continue
+            offsets = np.array(
+                [(dx, dy, dz) for dx in range(-radius, radius + 1)
+                 for dy in range(-radius, radius + 1)
+                 for dz in range(-radius, radius + 1)],
+                dtype=np.int64,
+            )
+            expanded = (subset[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
+            hashed_chunks.append(self._hash_voxel_coords_np(expanded))
+
+        if not hashed_chunks:
+            return 0
+
+        new_hashes = np.unique(np.concatenate(hashed_chunks, axis=0))
+        if self._deleted_voxel_hashes.size == 0:
+            self._deleted_voxel_hashes = new_hashes
+        else:
+            self._deleted_voxel_hashes = np.unique(
+                np.concatenate((self._deleted_voxel_hashes, new_hashes), axis=0)
+            )
+        self._deleted_voxel_hashes_torch = None
+        self._deleted_voxel_hashes_torch_device = None
+        return int(indices.size)
+
     def _refresh_edit_filters(self):
         if self._source_opacity is None or self._point_count <= 0:
             self._opacity = self._source_opacity
+            self._cached_visible_count = 0
+            self._cached_deleted_count = 0
             return
 
+        device = self._source_opacity.device
         if self._edit_state is None or self._edit_state.shape[0] != self._point_count:
-            self._opacity = self._source_opacity
-            return
+            hidden_t = torch.zeros((self._point_count,), dtype=torch.bool, device=device)
+            local_deleted_t = torch.zeros((self._point_count,), dtype=torch.bool, device=device)
+        else:
+            hidden_mask = (self._edit_state & self.STATE_HIDDEN) != 0
+            local_deleted_mask = (self._edit_state & self.STATE_DELETED) != 0
+            hidden_t = torch.from_numpy(hidden_mask)
+            local_deleted_t = torch.from_numpy(local_deleted_mask)
+            if device.type != "cpu":
+                hidden_t = hidden_t.to(device=device, non_blocking=True)
+                local_deleted_t = local_deleted_t.to(device=device, non_blocking=True)
 
-        visible = self._visible_mask()
-        if visible.size == 0 or visible.all():
+        transfer_deleted_t = self._deleted_transfer_mask_torch(device=device)
+        masked_t = hidden_t | local_deleted_t | transfer_deleted_t
+
+        self._cached_deleted_count = int((local_deleted_t | transfer_deleted_t).sum().item())
+        self._cached_visible_count = int((~masked_t).sum().item())
+
+        if not bool(masked_t.any().item()):
             self._opacity = self._source_opacity
             return
 
         self._ensure_masked_opacity_buffer()
         self._copy_into(self._masked_opacity_buffer[:self._point_count], self._source_opacity)
-        visible_mask = torch.from_numpy(visible.astype(np.float32))
-        if self._source_opacity.device.type != "cpu":
-            visible_mask = visible_mask.to(device=self._source_opacity.device, non_blocking=True)
+        visible_mask = (~masked_t).to(dtype=torch.float32)
         self._masked_opacity_buffer[:self._point_count].mul_(visible_mask[:, None])
         self._opacity = self._masked_opacity_buffer[:self._point_count]
 
@@ -2411,6 +2587,11 @@ class GaussianPointCloud:
             return arr
         arr = np.unique(arr)
         editable = (self._edit_state[arr] & (self.STATE_HIDDEN | self.STATE_DELETED)) == 0
+        if np.any(editable) and self._deleted_voxel_hashes.size > 0:
+            candidate = arr[editable]
+            deleted_mask = self._deleted_transfer_mask_torch(indices=candidate).detach().cpu().numpy()
+            editable_indices = np.flatnonzero(editable)
+            editable[editable_indices] &= ~deleted_mask
         return arr[editable]
 
     def _mark_state_changed(self, refresh_visibility=False):
@@ -2507,7 +2688,7 @@ class GaussianPointCloud:
         if self._xyz is None or self._features is None or self._scaling is None or self._rotation is None or self._source_opacity is None:
             raise RuntimeError("当前没有可导出的高斯点云数据")
 
-        keep_mask = self._visible_mask() if self._edit_state is not None else np.ones((self._point_count,), dtype=bool)
+        keep_mask = self._visible_mask()
         if keep_mask.size == 0 or not np.any(keep_mask):
             raise RuntimeError("当前没有可导出的可见高斯")
 
@@ -2631,6 +2812,7 @@ class GaussianPointCloud:
         selected = self._selected_mask() & self._visible_mask()
         count = int(selected.sum())
         if count > 0:
+            self._accumulate_deleted_transfer_from_indices(np.flatnonzero(selected))
             self._edit_state[selected] |= self.STATE_DELETED
             self._edit_state[selected] &= ~self.STATE_SELECTED
             self._mark_state_changed(refresh_visibility=True)
@@ -2639,10 +2821,16 @@ class GaussianPointCloud:
     def restore_deleted(self):
         if self._edit_state is None:
             return 0
-        deleted = (self._edit_state & self.STATE_DELETED) != 0
-        count = int(deleted.sum())
+        count = self.deleted_count
+        for state in self._edit_state_store.values():
+            state &= ~self.STATE_DELETED
+        if self._deleted_voxel_hashes.size > 0:
+            self._deleted_voxel_hashes = np.empty((0,), dtype=np.int64)
+            self._deleted_voxel_hashes_torch = None
+            self._deleted_voxel_hashes_torch_device = None
+        if self._deleted_voxel_size is not None:
+            self._deleted_voxel_size = None
         if count > 0:
-            self._edit_state[deleted] &= ~self.STATE_DELETED
             self._mark_state_changed(refresh_visibility=True)
         return count
 
@@ -2667,9 +2855,7 @@ class GaussianPointCloud:
 
     @property
     def visible_count(self):
-        if self._edit_state is None:
-            return 0
-        return int(self._visible_mask().sum())
+        return int(self._cached_visible_count)
 
     @property
     def hidden_count(self):
@@ -2679,9 +2865,7 @@ class GaussianPointCloud:
 
     @property
     def deleted_count(self):
-        if self._edit_state is None:
-            return 0
-        return int(((self._edit_state & self.STATE_DELETED) != 0).sum())
+        return int(self._cached_deleted_count)
 
     @property
     def edit_state_version(self):
@@ -3119,13 +3303,10 @@ class GaussianRenderer:
             xyz = xyz.index_select(0, base_indices)
             scaling = scaling.index_select(0, base_indices)
 
-        state = self.pc.get_state_mask(device=device)
-        if state is None:
-            visible_mask = torch.ones((xyz.shape[0],), dtype=torch.bool, device=device)
+        if indices is None:
+            visible_mask = self.pc.get_visible_mask_torch(device=device)
         else:
-            if indices is not None:
-                state = state.index_select(0, base_indices)
-            visible_mask = (state & (GaussianPointCloud.STATE_HIDDEN | GaussianPointCloud.STATE_DELETED)) == 0
+            visible_mask = self.pc.get_visible_mask_torch(indices=base_indices, device=device)
 
         right = torch.as_tensor(camera.R[:, 0], dtype=torch.float32, device=device)
         down = torch.as_tensor(camera.R[:, 1], dtype=torch.float32, device=device)
