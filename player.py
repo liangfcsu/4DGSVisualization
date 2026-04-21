@@ -268,7 +268,7 @@ class RenderView(QWidget):
             w = abs(self._selection_start[0] - self._selection_current[0])
             h = abs(self._selection_start[1] - self._selection_current[1])
             painter.drawRect(int(x0), int(y0), int(w), int(h))
-        elif self._image_rect and self._persistent_selection_rect:
+        elif self._selection_mode and self._image_rect and self._persistent_selection_rect:
             x0, y0, w, h = self._image_rect
             start_norm, end_norm = self._persistent_selection_rect
             rx0 = x0 + min(start_norm[0], end_norm[0]) * w
@@ -540,6 +540,8 @@ class MainWindow(QMainWindow):
         em.addAction(a)
         a = QAction("清空选择", self); a.setShortcut("Ctrl+Shift+A"); a.triggered.connect(self._clear_selection)
         em.addAction(a)
+        a = QAction("清除持续框", self); a.setShortcut("Shift+C"); a.triggered.connect(self._clear_selection_reference)
+        em.addAction(a)
         a = QAction("反选", self); a.setShortcut("Ctrl+I"); a.triggered.connect(self._invert_selection)
         em.addAction(a)
         em.addSeparator()
@@ -547,7 +549,7 @@ class MainWindow(QMainWindow):
         em.addAction(a)
         a = QAction("恢复隐藏", self); a.setShortcut("Shift+U"); a.triggered.connect(self._unhide_all)
         em.addAction(a)
-        a = QAction("删除选中", self); a.setShortcut("Delete"); a.triggered.connect(self._delete_selected)
+        a = QAction("删除选中", self); a.setShortcuts(["Delete", "Del", "Backspace"]); a.triggered.connect(self._delete_selected)
         em.addAction(a)
         a = QAction("恢复删除", self); a.setShortcut("Shift+R"); a.triggered.connect(self._restore_deleted)
         em.addAction(a)
@@ -709,6 +711,7 @@ class MainWindow(QMainWindow):
         self.left_panel.selection_mode_toggled.connect(self._set_selection_mode)
         self.left_panel.select_all_clicked.connect(self._select_all)
         self.left_panel.clear_selection_clicked.connect(self._clear_selection)
+        self.left_panel.clear_selection_rect_clicked.connect(self._clear_selection_reference)
         self.left_panel.invert_selection_clicked.connect(self._invert_selection)
         self.left_panel.hide_selected_clicked.connect(self._hide_selected)
         self.left_panel.unhide_all_clicked.connect(self._unhide_all)
@@ -768,10 +771,12 @@ class MainWindow(QMainWindow):
         self._register_shortcut(Qt.Key_V, self._toggle_selection_mode)
         self._register_shortcut("Ctrl+A", self._select_all)
         self._register_shortcut("Ctrl+Shift+A", self._clear_selection)
+        self._register_shortcut("Shift+C", self._clear_selection_reference)
         self._register_shortcut("Ctrl+I", self._invert_selection)
         self._register_shortcut("Shift+H", self._hide_selected)
         self._register_shortcut("Shift+U", self._unhide_all)
         self._register_shortcut("Delete", self._delete_selected)
+        self._register_shortcut("Del", self._delete_selected)
         self._register_shortcut("Backspace", self._delete_selected)
         self._register_shortcut("Shift+R", self._restore_deleted)
         self._register_shortcut(Qt.Key_Tab, self._toggle_panels)
@@ -1193,6 +1198,8 @@ class MainWindow(QMainWindow):
 
     def _set_selection_mode(self, enabled: bool):
         enabled = bool(enabled)
+        if not enabled:
+            self._clear_selection_reference(quiet=True)
         self.ui_state.selection_mode = enabled
         self.left_panel.sync_selection_mode(enabled)
         self.overlay.set_selection_mode(enabled)
@@ -1240,6 +1247,16 @@ class MainWindow(QMainWindow):
         self._clear_sticky_rect_selection()
         self.pc.clear_selection()
         self._apply_selection_feedback("清空选择")
+
+    def _clear_selection_reference(self, quiet=False):
+        had_rect = bool(self._sticky_rect_selection)
+        self._clear_sticky_rect_selection()
+        if quiet:
+            return
+        if had_rect:
+            self._apply_selection_feedback("已清除持续框参考，当前选择结果已保留")
+        else:
+            self.toast.show_message("当前没有需要清除的持续框", 1500)
 
     def _select_all(self):
         self._clear_sticky_rect_selection()
@@ -1479,7 +1496,7 @@ class MainWindow(QMainWindow):
 &nbsp;&nbsp;框选区域会在换帧时自动沿用；点选 / 全选 / 清空 / 反选会取消沿用<br>
 &nbsp;&nbsp;<b>Shift</b> — 添加到选择 &nbsp; <b>Ctrl</b> — 从选择中移除<br>
 &nbsp;&nbsp;<b>Ctrl+A</b> — 全选 &nbsp; <b>Ctrl+Shift+A</b> — 清空选择 &nbsp; <b>Ctrl+I</b> — 反选<br>
-&nbsp;&nbsp;<b>Delete</b> — 删除选中 &nbsp; <b>Shift+H</b> — 隐藏选中<br>
+&nbsp;&nbsp;<b>Delete/Del</b> — 删除选中 &nbsp; <b>Shift+C</b> — 清除持续框 &nbsp; <b>Shift+H</b> — 隐藏选中<br>
 &nbsp;&nbsp;<b>Shift+U</b> — 恢复隐藏 &nbsp; <b>Shift+R</b> — 恢复删除<br><br>
 
 <b>相机移动</b><br>

@@ -34,6 +34,7 @@ class LeftControlPanel(QWidget):
     selection_mode_toggled  = pyqtSignal(bool)
     select_all_clicked      = pyqtSignal()
     clear_selection_clicked = pyqtSignal()
+    clear_selection_rect_clicked = pyqtSignal()
     invert_selection_clicked = pyqtSignal()
     hide_selected_clicked   = pyqtSignal()
     unhide_all_clicked      = pyqtSignal()
@@ -206,10 +207,11 @@ class LeftControlPanel(QWidget):
         buttons = [
             ("全选", self.select_all_clicked.emit, "选择全部可见高斯 (Ctrl+A)"),
             ("清空", self.clear_selection_clicked.emit, "清空当前选择 (Ctrl+Shift+A)"),
+            ("清框参考", self.clear_selection_rect_clicked.emit, "清除持续框参考，保留当前已选结果 (Shift+C)"),
             ("反选", self.invert_selection_clicked.emit, "反转当前可见高斯的选择状态 (Ctrl+I)"),
             ("隐藏选中", self.hide_selected_clicked.emit, "隐藏选中的高斯 (Shift+H)"),
             ("恢复隐藏", self.unhide_all_clicked.emit, "恢复所有被隐藏的高斯 (Shift+U)"),
-            ("删除选中", self.delete_selected_clicked.emit, "删除选中的高斯 (Delete)"),
+            ("删除选中", self.delete_selected_clicked.emit, "删除选中的高斯 (Del/Delete/Backspace)"),
             ("恢复删除", self.restore_deleted_clicked.emit, "恢复所有被删除的高斯 (Shift+R)"),
         ]
 

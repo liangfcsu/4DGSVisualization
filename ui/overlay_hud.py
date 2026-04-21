@@ -185,7 +185,7 @@ class ViewportOverlay(QWidget):
         if self._selection_enabled:
             return (
                 "左键: 点选  |  左键拖拽: 框选  |  Shift: 添加  |  Ctrl: 移除\n"
-                "框选会在换帧时自动沿用  |  Delete: 删除  |  Shift+H: 隐藏"
+                "框选会在换帧时自动沿用  |  Del/Delete: 删除  |  Shift+C: 清框"
             )
         return (
             "拖动: 旋转  |  右键/中键: 平移  |  滚轮: 缩放\n"

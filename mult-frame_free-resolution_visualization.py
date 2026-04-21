@@ -3346,6 +3346,61 @@ class GaussianRenderer:
             "valid": valid,
         }
 
+    def _project_gaussian_centers(self, camera, indices=None):
+        xyz = self.pc.get_xyz
+        if xyz is None or xyz.numel() == 0:
+            return None
+
+        device = xyz.device
+        if indices is None:
+            base_indices = torch.arange(xyz.shape[0], device=device, dtype=torch.long)
+        else:
+            if isinstance(indices, torch.Tensor):
+                base_indices = indices.to(device=device, dtype=torch.long)
+            else:
+                base_indices = torch.as_tensor(indices, device=device, dtype=torch.long)
+            if base_indices.numel() == 0:
+                return None
+            xyz = xyz.index_select(0, base_indices)
+
+        if indices is None:
+            visible_mask = self.pc.get_visible_mask_torch(device=device)
+        else:
+            visible_mask = self.pc.get_visible_mask_torch(indices=base_indices, device=device)
+
+        right = torch.as_tensor(camera.R[:, 0], dtype=torch.float32, device=device)
+        down = torch.as_tensor(camera.R[:, 1], dtype=torch.float32, device=device)
+        forward = torch.as_tensor(camera.R[:, 2], dtype=torch.float32, device=device)
+        position = torch.as_tensor(camera.position, dtype=torch.float32, device=device)
+
+        rel = xyz - position.unsqueeze(0)
+        cam_x = rel @ right
+        cam_y = rel @ down
+        cam_z = rel @ forward
+
+        tan_half_x = math.tan(camera.FoVx * 0.5)
+        tan_half_y = math.tan(camera.FoVy * 0.5)
+        focal_x = camera.width / max(1e-6, 2.0 * tan_half_x)
+        focal_y = camera.height / max(1e-6, 2.0 * tan_half_y)
+
+        safe_z = cam_z.clamp_min(max(camera.znear, 1e-4))
+        screen_x = cam_x * (focal_x / safe_z) + camera.width * 0.5
+        screen_y = cam_y * (focal_y / safe_z) + camera.height * 0.5
+
+        valid = visible_mask & (cam_z > max(camera.znear, 1e-4))
+        valid &= screen_x >= 0.0
+        valid &= screen_x <= float(camera.width)
+        valid &= screen_y >= 0.0
+        valid &= screen_y <= float(camera.height)
+
+        return {
+            "indices": base_indices,
+            "screen_x": screen_x,
+            "screen_y": screen_y,
+            "depth": cam_z,
+            "valid": valid,
+        }
+
     def pick_point(self, camera, norm_x, norm_y, min_pick_radius=6.0, fallback_radius=14.0):
         with torch.inference_mode():
             projected = self._project_gaussians(camera)
@@ -3382,7 +3437,7 @@ class GaussianRenderer:
 
     def pick_rect(self, camera, start_norm, end_norm):
         with torch.inference_mode():
-            projected = self._project_gaussians(camera)
+            projected = self._project_gaussian_centers(camera)
             if projected is None:
                 return np.empty((0,), dtype=np.int64)
 
@@ -3408,7 +3463,7 @@ class GaussianRenderer:
                 .astype(np.int64, copy=False)
             )
 
-    def get_selection_overlay(self, camera, max_points=1024):
+    def get_selection_overlay(self, camera, max_points=384):
         selected = self.pc.get_selected_indices()
         if selected.size == 0:
             return []
