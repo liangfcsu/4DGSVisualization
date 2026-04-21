@@ -2260,12 +2260,13 @@ class GaussianPointCloud:
     VOXEL_HASH_P2 = np.int64(19349663)
     VOXEL_HASH_P3 = np.int64(83492791)
 
-    def __init__(self, ply_path, sh_degree=3, device="cuda", max_gaussians=None):
-        self.device = device
+    def __init__(self, ply_path, sh_degree=3, device="cuda", max_gaussians=None, cpu_only=False):
+        self.device = device if not cpu_only else "cpu"
         self.max_sh_degree = sh_degree
         self.active_sh_degree = sh_degree
         self.ply_path = ply_path
         self.max_gaussians = max_gaussians
+        self.cpu_only = cpu_only  # 【关键】CPU-only模式不创建GPU buffer
         self._reset_storage()
         self.load_ply(ply_path)
 
@@ -2282,6 +2283,40 @@ class GaussianPointCloud:
         return pc
 
     def _reset_storage(self):
+        # 【关键】CPU-only模式：不创建任何buffer，避免触碰GPU
+        if getattr(self, 'cpu_only', False):
+            print("[点云] CPU-only占位模式：不创建任何GPU buffer")
+            self._xyz_buffer = None
+            self._features_buffer = None
+            self._scaling_buffer = None
+            self._rotation_buffer = None
+            self._opacity_buffer = None
+            self._masked_opacity_buffer = None
+            self._frame_ref = None
+            self._xyz = None
+            self._features = None
+            self._scaling = None
+            self._rotation = None
+            self._opacity = None
+            self._source_opacity = None
+            self._point_count = 0
+            self._buffer_capacity = 0
+            self._sample_index_cache = {}
+            self._edit_state = None
+            self._edit_state_key = None
+            self._edit_state_store = {}
+            self._deleted_voxel_hashes = np.empty((0,), dtype=np.int64)
+            self._deleted_voxel_size = None
+            self._deleted_voxel_hashes_torch = None
+            self._deleted_voxel_hashes_torch_device = None
+            self._cached_visible_count = 0
+            self._cached_deleted_count = 0
+            self._edit_state_version = 0
+            self.scene_center = np.zeros(3, dtype=np.float32)
+            self.scene_extent = 1.0
+            return
+        
+        # GPU模式：正常初始化
         self._xyz_buffer = None
         self._features_buffer = None
         self._scaling_buffer = None
@@ -2735,6 +2770,16 @@ class GaussianPointCloud:
 
     def load_ply(self, path):
         """从PLY文件加载高斯点云"""
+        # 【关键】CPU-only占位模式：不加载任何数据，避免触碰GPU
+        if getattr(self, 'cpu_only', False):
+            print(f"[点云] CPU-only占位模式：跳过加载 {path}")
+            # 设置最小属性避免崩溃
+            self.scene_center = np.zeros(3, dtype=np.float32)
+            self.scene_extent = 1.0
+            self._point_count = 1
+            return
+        
+        # 正常GPU加载
         frame = GaussianFrame.from_ply(
             path,
             sh_degree=self.max_sh_degree,
@@ -2948,26 +2993,39 @@ class GaussianPointCloud:
 
     @property
     def get_xyz(self):
+        # 【关键】CPU-only模式：返回假tensor避免崩溃
+        if getattr(self, 'cpu_only', False):
+            return torch.zeros((1, 3), dtype=torch.float32, device='cpu')
         return self._xyz
 
     @property
     def get_scaling(self):
+        if getattr(self, 'cpu_only', False):
+            return torch.zeros((1, 3), dtype=torch.float32, device='cpu')
         return self._scaling
 
     @property
     def get_rotation(self):
+        if getattr(self, 'cpu_only', False):
+            return torch.zeros((1, 4), dtype=torch.float32, device='cpu')
         return self._rotation
 
     @property
     def get_opacity(self):
+        if getattr(self, 'cpu_only', False):
+            return torch.zeros((1, 1), dtype=torch.float32, device='cpu')
         return self._opacity
 
     @property
     def get_source_opacity(self):
+        if getattr(self, 'cpu_only', False):
+            return torch.zeros((1, 1), dtype=torch.float32, device='cpu')
         return self._source_opacity if self._source_opacity is not None else self._opacity
 
     @property
     def get_features(self):
+        if getattr(self, 'cpu_only', False):
+            return torch.zeros((1, 3, 1), dtype=torch.float32, device='cpu')
         return self._features
 
 

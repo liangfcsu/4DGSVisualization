@@ -44,6 +44,7 @@ class LeftControlPanel(QWidget):
     restore_deleted_clicked = pyqtSignal()
     load_sequence_clicked   = pyqtSignal()
     load_camera_clicked     = pyqtSignal()
+    training_source_selected = pyqtSignal(str)  # input.ply路径，立即加载替换空白点云
     start_training_clicked  = pyqtSignal(str, str, int)  # source_path, model_path, iterations
     stop_training_clicked   = pyqtSignal()
 
@@ -260,7 +261,7 @@ class LeftControlPanel(QWidget):
         self._training_output = None
     
     def _select_training_source(self):
-        from PyQt5.QtWidgets import QFileDialog
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
         dir_path = QFileDialog.getExistingDirectory(
             self,
             "选择训练数据目录",
@@ -271,6 +272,14 @@ class LeftControlPanel(QWidget):
             self._training_source = dir_path
             import os
             self.training_source_path.setText(os.path.basename(dir_path))
+            
+            # 【关键修复】立即发射信号加载input.ply替换空白点云
+            input_ply = os.path.join(dir_path, "input.ply")
+            if os.path.exists(input_ply):
+                print(f"[训练数据] 检测到input.ply，发射信号通知player加载")
+                self.training_source_selected.emit(input_ply)
+            else:
+                print(f"[训练数据] ⚠ 未找到input.ply: {input_ply}")
     
     def _select_training_output(self):
         from PyQt5.QtWidgets import QFileDialog

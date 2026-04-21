@@ -39,6 +39,8 @@ import os
 import time
 import argparse
 import importlib.util
+import glob
+import re
 from datetime import datetime
 
 import numpy as np
@@ -56,6 +58,7 @@ SequenceManager    = _core.SequenceManager
 GaussianPointCloud = _core.GaussianPointCloud
 GaussianRenderer   = _core.GaussianRenderer
 InteractiveCamera  = _core.InteractiveCamera
+SH_C0              = _core.SH_C0
 
 # ─── 第二步：修正 Qt 插件路径 ─────────────────────────────────────────────────
 try:
@@ -77,7 +80,7 @@ try:
         QToolBar, QStatusBar, QAction, QMenu, QSizePolicy,
         QFrame, QMessageBox, QFileDialog, QShortcut,
     )
-    from PyQt5.QtCore import Qt, QTimer, QSize
+    from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal
     from PyQt5.QtGui import QImage, QPixmap, QPalette, QColor, QIcon, QKeySequence
 except ImportError:
     print("错误: 请先安装 PyQt5:  pip install PyQt5")
@@ -885,6 +888,9 @@ class RenderView(QWidget):
 # MainWindow — 主窗口 (使用模块化 UI 组件)
 # ═══════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
+    training_visualization_requested = pyqtSignal(str, int)
+    training_complete_requested = pyqtSignal()
+    training_error_requested = pyqtSignal(str)
 
     def __init__(
         self,
@@ -895,11 +901,45 @@ class MainWindow(QMainWindow):
         render_h:    int = 720,
     ):
         super().__init__()
+        self.training_visualization_requested.connect(self._load_training_ply)
+        self.training_complete_requested.connect(self._handle_training_complete)
+        self.training_error_requested.connect(self._handle_training_error)
+        
+        # ── 处理空白启动（renderer=None）──
+        if renderer is None:
+            print("[MainWindow] 空白启动模式：创建虚拟渲染器")
+            # 创建最小化的虚拟点云用于初始化
+            import sys
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                'mult_frame_viz', 
+                'mult-frame_free-resolution_visualization.py'
+            )
+            viz_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(viz_module)
+            GaussianRenderer = viz_module.GaussianRenderer
+            
+            import torch
+            class DummyPC:
+                def __init__(self):
+                    self.get_xyz = torch.zeros((0, 3), dtype=torch.float32)
+                    self.get_features = torch.zeros((0, 3, 1), dtype=torch.float32)
+                    self.get_scaling = torch.zeros((0, 3), dtype=torch.float32)
+                    self.get_rotation = torch.zeros((0, 4), dtype=torch.float32)
+                    self.get_opacity = torch.zeros((0, 1), dtype=torch.float32)
+                    self.scene_center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                    self.scene_extent = 1.0
+            
+            dummy_pc = DummyPC()
+            renderer = GaussianRenderer(dummy_pc, bg_color=[0, 0, 0])
+            self.pc = None  # 标记为空状态
+        else:
+            self.pc = renderer.pc
+        
         # ── Core objects (不改动) ──
         self.renderer   = renderer
         self.camera     = camera
         self.seq        = seq
-        self.pc         = renderer.pc
         self.render_w   = render_w
         self.render_h   = render_h
         self._preferred_frame_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -915,9 +955,26 @@ class MainWindow(QMainWindow):
         self._training_update_timer.timeout.connect(self._update_training_status)
         self._training_visualization_enabled = True
         self._last_loaded_ply = None
+        self._last_loaded_iteration = 0
+        self._last_failed_training_iteration = -1
+        self._training_cpu_preview_mode = False
+        self._training_cpu_preview = None
+        self._training_preview_iteration = 0
+        self._training_preview_camera_initialized = False
 
         # ── Runtime state ──
         self._fps_avg      = 0.0
+        self._last_t       = time.time()
+        self._keys_held: set = set()
+        self._needs_render = True
+        self._shortcuts    = []
+        self._last_event   = ""
+        self._update_counter = 0
+        self._pending_seek_preview = None
+        self._sticky_rect_selection = None
+        self._sticky_rect_selection_op = "set"
+
+        # ── UI State ──
         self._last_t       = time.time()
         self._keys_held: set = set()
         self._needs_render = True
@@ -1131,12 +1188,18 @@ class MainWindow(QMainWindow):
         self.left_panel.sync_resolution(self.render_w, self.render_h)
         self.left_panel.sync_point_size(self.ui_state.point_size)
         self.left_panel.sync_selection_mode(self.ui_state.selection_mode)
-        self.left_panel.sync_selection_stats(
-            self.pc.selection_count,
-            self.pc.visible_count,
-            self.pc.hidden_count,
-            self.pc.deleted_count,
-        )
+        
+        # 【关键】处理空白启动：pc=None 时使用默认值
+        if self.pc is None:
+            self.left_panel.sync_selection_stats(0, 0, 0, 0)
+        else:
+            self.left_panel.sync_selection_stats(
+                self.pc.selection_count,
+                self.pc.visible_count,
+                self.pc.hidden_count,
+                self.pc.deleted_count,
+            )
+        
         # Sync camera params
         self.left_panel.move_speed_spin.blockSignals(True)
         self.left_panel.move_speed_spin.setValue(self.camera.move_speed)
@@ -1194,6 +1257,7 @@ class MainWindow(QMainWindow):
         self.left_panel.restore_deleted_clicked.connect(self._restore_deleted)
         self.left_panel.load_sequence_clicked.connect(self._load_sequence)
         self.left_panel.load_camera_clicked.connect(self._load_camera_params)
+        self.left_panel.training_source_selected.connect(self.load_initial_training_ply)  # 【关键连接】选择训练数据时立即加载
         self.left_panel.start_training_clicked.connect(self._start_training)
         self.left_panel.stop_training_clicked.connect(self._stop_training)
 
@@ -1338,6 +1402,14 @@ class MainWindow(QMainWindow):
             if not (self._needs_render or frame_updated or self.view.is_interacting()):
                 return
 
+            if self._training_cpu_preview_mode and self._training_cpu_preview is not None:
+                img = self._render_training_preview_cpu()
+                self.view.update_image(img)
+                self.view.set_selection_overlay_points([])
+                self._needs_render = False
+                self._update_ui()
+                return
+
             # GPU 渲染 (不改动)
             rendered = self.renderer.render(self.camera)
 
@@ -1413,11 +1485,19 @@ class MainWindow(QMainWindow):
         self.ui_state.render_h = self.render_h
         self.ui_state.window_w = self.view.width()
         self.ui_state.window_h = self.view.height()
-        self.ui_state.total_gaussians = self.pc.get_xyz.shape[0] if hasattr(self.pc, 'get_xyz') and self.pc.get_xyz is not None else 0
-        self.ui_state.visible_gaussians = self.pc.visible_count
-        self.ui_state.selected_gaussians = self.pc.selection_count
-        self.ui_state.hidden_gaussians = self.pc.hidden_count
-        self.ui_state.deleted_gaussians = self.pc.deleted_count
+        if self._training_cpu_preview_mode and self._training_cpu_preview is not None:
+            preview_count = int(self._training_cpu_preview.get("point_count", 0))
+            self.ui_state.total_gaussians = preview_count
+            self.ui_state.visible_gaussians = preview_count
+            self.ui_state.selected_gaussians = 0
+            self.ui_state.hidden_gaussians = 0
+            self.ui_state.deleted_gaussians = 0
+        else:
+            self.ui_state.total_gaussians = self.pc.get_xyz.shape[0] if hasattr(self.pc, 'get_xyz') and self.pc.get_xyz is not None else 0
+            self.ui_state.visible_gaussians = self.pc.visible_count
+            self.ui_state.selected_gaussians = self.pc.selection_count
+            self.ui_state.hidden_gaussians = self.pc.hidden_count
+            self.ui_state.deleted_gaussians = self.pc.deleted_count
 
         cache_str = ""
         if self.seq:
@@ -1620,6 +1700,7 @@ class MainWindow(QMainWindow):
 
     def _on_bg_changed(self, idx: int):
         color = [1.0, 1.0, 1.0] if idx else [0.0, 0.0, 0.0]
+        self.ui_state.background_idx = int(idx)
         self.renderer.set_background_color(color)
         self._request_render()
 
@@ -2099,13 +2180,24 @@ class MainWindow(QMainWindow):
         try:
             self.toast.show_message("正在启动训练...", 2000)
             
-            # 立即加载初始PLY文件进行可视化
-            initial_ply = os.path.join(source_path, "input.ply")
-            if os.path.exists(initial_ply) and self._training_visualization_enabled:
-                print(f"[训练] 加载初始点云: {initial_ply}")
-                self._load_training_ply(initial_ply, 0)
-                self.toast.show_message("初始点云已加载，训练即将开始...", 2000)
-                QApplication.processEvents()
+            # 重置加载状态（避免旧checkpoint干扰）
+            self._last_loaded_ply = None
+            self._last_loaded_iteration = 0
+            self._last_failed_training_iteration = -1
+            self._training_cpu_preview_mode = False
+            self._training_cpu_preview = None
+            self._training_preview_iteration = 0
+            self._training_preview_camera_initialized = False
+            if hasattr(self.training_manager, 'last_loaded_iteration'):
+                self.training_manager.last_loaded_iteration = 0
+                print(f"[训练] 重置checkpoint加载状态")
+            
+            # input.ply应该已经在选择训练数据时加载了
+            # 【修改】不再加载input.ply，让训练生成第一个checkpoint后自动加载
+            print(f"[训练] 不加载input.ply，等待第一个checkpoint（frame_000010.ply）生成")
+            print(f"[训练] GPU状态干净，CUDA未被使用")
+            print(f"[训练] 训练即将开始，每10次迭代自动更新...")
+
             
             # 启动训练
             self.training_manager.start_training(
@@ -2135,6 +2227,24 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
     
+    def load_initial_training_ply(self, ply_path: str):
+        """记录训练数据路径（不预加载，等第一个checkpoint生成后再加载）"""
+        try:
+            print(f"[预加载] 记录训练数据路径: {ply_path}")
+            
+            # 只更新窗口标题，不做任何GPU操作
+            import os
+            self.setWindowTitle(f"4DGS Viewer · {os.path.basename(os.path.dirname(ply_path))}")
+            
+            # 显示提示
+            self.toast.show_message(f"✓ 训练数据已选择，等待训练开始...", 2000)
+            print(f"[预加载] ✓ 不预加载 input.ply，等待训练生成第一个checkpoint")
+            
+        except Exception as e:
+            print(f"[预加载] ✗ 失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def _stop_training(self):
         """停止训练"""
         self.training_manager.stop_training()
@@ -2142,16 +2252,13 @@ class MainWindow(QMainWindow):
         self.left_panel.set_training_active(False)
         # 隐藏训练信息
         self.right_panel.update_training_info(status=None)
-        self.toast.show_message("训练已停止", 2000)
-        self._set_last_event("训练已停止")
-        self._last_loaded_ply = None
+        self.toast.show_message("训练已停止，保留最后预览", 2500)
+        self._set_last_event("训练已停止（保留最后预览）")
     
     def _update_training_status(self):
         """更新训练状态（定时器回调）"""
         statuses = self.training_manager.get_status()
-        if not statuses:
-            return
-            
+
         for status in statuses:
             msg = status['message']
             data = status.get('data', {})
@@ -2182,12 +2289,143 @@ class MainWindow(QMainWindow):
                 loss=loss,
                 num_points=num_points
             )
+        
+        if self._training_visualization_enabled:
+            self._update_training_visualization()
     
     def _on_training_visualization_update(self, ply_path: str, iteration: int):
         """训练可视化更新回调 - 在训练线程中调用"""
-        # 使用QTimer在主线程中更新UI
-        QTimer.singleShot(0, lambda: self._load_training_ply(ply_path, iteration))
-    
+        self.training_visualization_requested.emit(ply_path, int(iteration))
+
+    def _configure_camera_for_scene(self, scene_center, scene_extent, reset_view=False):
+        """将相机场景参数对齐到给定场景。"""
+        scene_center = np.asarray(scene_center, dtype=np.float32)
+        scene_extent = max(float(scene_extent), 1e-3)
+        self.camera.scene_center = scene_center.copy()
+        self.camera.scene_extent = scene_extent
+        self.camera.trackball_center = scene_center.copy()
+        self.camera.trackball_radius = max(scene_extent * 0.5, 1e-3)
+        self.camera.move_speed = max(scene_extent * 0.002, 1e-4)
+        if reset_view:
+            self.camera.reset()
+
+    def _initialize_training_preview_camera(self, scene_center, scene_extent, force=False):
+        if self._training_preview_camera_initialized and not force:
+            return
+        self._configure_camera_for_scene(scene_center, scene_extent, reset_view=True)
+        self._training_preview_camera_initialized = True
+
+    def _activate_training_cpu_preview(self, ply_path: str, iteration: int, reason: str | None = None):
+        """在 GPU 热切换失败时，回退到 CPU 预览渲染。"""
+        frame = GaussianFrame.from_ply(
+            ply_path,
+            sh_degree=3,
+            pin_memory=False,
+            max_gaussians=None,
+            verbose=True,
+        )
+        xyz = frame.xyz.detach().cpu().numpy()
+        features = frame.features.detach().cpu().numpy()
+        opacity = frame.opacity.detach().cpu().numpy().reshape(-1)
+        scale = frame.scaling.detach().cpu().numpy()
+
+        max_preview_points = 20000
+        if xyz.shape[0] > max_preview_points:
+            sample_idx = np.linspace(0, xyz.shape[0] - 1, num=max_preview_points, dtype=np.int64)
+            xyz = xyz[sample_idx]
+            features = features[sample_idx]
+            opacity = opacity[sample_idx]
+            scale = scale[sample_idx]
+
+        self._training_cpu_preview_mode = True
+        self._training_cpu_preview = {
+            "xyz": np.ascontiguousarray(xyz, dtype=np.float32),
+            "colors": np.clip(features[:, 0, :] * SH_C0 + 0.5, 0.0, 1.0).astype(np.float32, copy=False),
+            "opacity": np.clip(opacity, 0.05, 1.0).astype(np.float32, copy=False),
+            "scale": np.max(scale, axis=1).astype(np.float32, copy=False),
+            "point_count": int(frame.tensor_count),
+            "scene_center": frame.scene_center.copy(),
+            "scene_extent": float(frame.scene_extent),
+        }
+        self._training_preview_iteration = int(iteration)
+        self._last_loaded_ply = ply_path
+        self._last_loaded_iteration = int(iteration)
+        self._last_failed_training_iteration = -1
+        self._initialize_training_preview_camera(frame.scene_center, frame.scene_extent)
+
+        base_title = self.windowTitle().split(' [')[0]
+        self.setWindowTitle(f"{base_title} [训练迭代: {iteration} | CPU预览]")
+        if reason:
+            self.toast.show_message(f"训练预览已切换到 CPU 安全模式: {reason}", 3000)
+        self._request_render()
+
+    def _render_training_preview_cpu(self):
+        """使用 CPU 将训练中的高斯快照渲染为轻量预览图。"""
+        preview = self._training_cpu_preview
+        width = max(1, int(self.camera.width))
+        height = max(1, int(self.camera.height))
+        bg_value = 255.0 if int(getattr(self.ui_state, "background_idx", 0)) else 0.0
+        image = np.full((height, width, 3), bg_value, dtype=np.float32)
+
+        xyz = preview["xyz"]
+        colors = preview["colors"]
+        opacity = preview["opacity"]
+        scale = preview["scale"]
+        if xyz.size == 0:
+            return image.astype(np.uint8)
+
+        right = self.camera.R[:, 0].astype(np.float32)
+        down = self.camera.R[:, 1].astype(np.float32)
+        forward = self.camera.R[:, 2].astype(np.float32)
+        position = self.camera.position.astype(np.float32)
+
+        rel = xyz - position[None, :]
+        cam_x = rel @ right
+        cam_y = rel @ down
+        cam_z = rel @ forward
+
+        tan_half_x = math.tan(float(self.camera.FoVx) * 0.5)
+        tan_half_y = math.tan(float(self.camera.FoVy) * 0.5)
+        focal_x = width / max(1e-6, 2.0 * tan_half_x)
+        focal_y = height / max(1e-6, 2.0 * tan_half_y)
+        safe_z = np.maximum(cam_z, 1e-4)
+        screen_x = cam_x * (focal_x / safe_z) + width * 0.5
+        screen_y = cam_y * (focal_y / safe_z) + height * 0.5
+
+        valid = cam_z > 1e-4
+        valid &= screen_x >= 0.0
+        valid &= screen_x < float(width)
+        valid &= screen_y >= 0.0
+        valid &= screen_y < float(height)
+        if not np.any(valid):
+            return image.astype(np.uint8)
+
+        order = np.argsort(cam_z[valid])[::-1]
+        valid_idx = np.flatnonzero(valid)[order]
+        px = np.rint(screen_x[valid_idx]).astype(np.int32)
+        py = np.rint(screen_y[valid_idx]).astype(np.int32)
+        point_radius = np.clip(
+            np.rint(scale[valid_idx] * max(focal_x, focal_y) * max(0.7, float(self.renderer.point_size)) / safe_z[valid_idx]).astype(np.int32),
+            2,
+            4,
+        )
+        color255 = colors[valid_idx] * 255.0
+        alpha = opacity[valid_idx][:, None]
+
+        for idx in range(valid_idx.size):
+            x = int(px[idx])
+            y = int(py[idx])
+            r = int(point_radius[idx])
+            x0 = max(0, x - r)
+            x1 = min(width, x + r + 1)
+            y0 = max(0, y - r)
+            y1 = min(height, y + r + 1)
+            patch = image[y0:y1, x0:x1]
+            patch *= (1.0 - alpha[idx])
+            patch += color255[idx] * alpha[idx]
+
+        return np.clip(image, 0.0, 255.0).astype(np.uint8)
+
     def _load_training_ply(self, ply_path: str, iteration: int):
         """加载训练中的PLY文件到渲染器"""
         try:
@@ -2198,22 +2436,58 @@ class MainWindow(QMainWindow):
             if not os.path.exists(ply_path):
                 print(f"[可视化] ❌ 文件不存在: {ply_path}")
                 return
+
+            session_started_at = getattr(self.training_manager, "session_started_at", 0.0)
+            if session_started_at > 0.0:
+                try:
+                    if os.path.getmtime(ply_path) + 1e-6 < session_started_at:
+                        print(f"[可视化] ⚠ 跳过历史训练结果: {ply_path}")
+                        return
+                except OSError:
+                    return
             
-            # 避免重复加载
-            if self._last_loaded_ply == ply_path:
+            # 避免重复加载或旧结果回退覆盖新结果
+            if iteration < self._last_loaded_iteration:
+                print(f"[可视化] ⚠ 已有更高迭代 {self._last_loaded_iteration}，跳过旧结果")
+                return
+            if iteration <= self._last_failed_training_iteration:
+                print(f"[可视化] ⚠ 迭代 {iteration} 之前已加载失败，等待更新结果")
+                return
+            if iteration == self._last_loaded_iteration and self._last_loaded_ply == ply_path:
                 print(f"[可视化] ⚠ 文件已加载，跳过")
                 return
-            
-            self._last_loaded_ply = ply_path
-            
+
+            # 【强制禁用CPU预览模式，使用GPU渲染】
+            # CPU预览模式不会更新GPU渲染器，导致窗口不更新
+            # if self._training_cpu_preview_mode:
+            #     self._activate_training_cpu_preview(ply_path, iteration)
+            #     ...
+            # 直接跳过CPU预览，强制走GPU路径
+
             # 加载新的点云
-            print(f"[可视化] 🔄 开始加载点云...")
+            print(f"[可视化] 🔄 开始加载点云（GPU模式）...")
+            
+            # 温和地清理CUDA状态（避免del导致崩溃）
+            import torch
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    print(f"[可视化] ✓ CUDA缓存已清理")
+                except Exception as e:
+                    print(f"[可视化] ⚠ CUDA清理失败（忽略）: {e}")
+            
+            # 加载新点云
             new_pc = GaussianPointCloud(ply_path, sh_degree=3, max_gaussians=None)
             print(f"[可视化] ✓ 点云创建成功，点数: {new_pc.get_xyz.shape[0]:,}")
             
-            # 更新渲染器的点云引用
+            # 更新渲染器的点云引用（不删除旧对象，让GC自然回收）
             self.pc = new_pc
             self.renderer.pc = new_pc
+            self._last_loaded_ply = ply_path
+            self._last_loaded_iteration = int(iteration)
+            self._last_failed_training_iteration = -1
+            self._initialize_training_preview_camera(new_pc.scene_center, new_pc.scene_extent)
             print(f"[可视化] ✓ 渲染器已更新")
             
             # 更新窗口标题显示当前迭代
@@ -2227,19 +2501,54 @@ class MainWindow(QMainWindow):
             print(f"[可视化] ✓ 渲染请求已发送 (_needs_render={self._needs_render})")
             
             # 显示提示
-            if iteration % 500 == 0:  # 每500次迭代显示一次提示
-                self.toast.show_message(f"✓ 训练进度: {iteration} 次迭代，点数: {new_pc.get_xyz.shape[0]:,}", 3000)
+            if iteration % 100 == 0:  # 每100次迭代显示一次提示
+                point_count = new_pc.get_xyz.shape[0]
+                self.toast.show_message(f"✓ 迭代 {iteration} | 点数: {point_count:,}", 2000)
             
             print(f"[可视化] ========================================")
             
         except Exception as e:
+            self._last_failed_training_iteration = max(self._last_failed_training_iteration, int(iteration))
             print(f"[可视化] 加载训练PLY失败: {e}")
             import traceback
             traceback.print_exc()
+            error_text = str(e)
+            if "CUDA error" in error_text or "AcceleratorError" in error_text:
+                try:
+                    self._activate_training_cpu_preview(ply_path, iteration, reason="GPU 热更新不稳定")
+                    print(f"[可视化] ✓ 已回退到 CPU 预览模式")
+                    return
+                except Exception as cpu_e:
+                    print(f"[可视化] CPU 预览回退失败: {cpu_e}")
     
     def _update_training_visualization(self):
-        """更新训练可视化（已被 _on_training_visualization_update 替代）"""
-        pass
+        """轮询 current/ 目录，兜底加载最新训练结果。"""
+        current_dir = getattr(self.training_manager, "current_dir", None)
+        if not current_dir or not os.path.isdir(current_dir):
+            return
+
+        latest_iter = -1
+        latest_ply = None
+        for ply_path in glob.glob(os.path.join(current_dir, "frame_*.ply")):
+            name = os.path.basename(ply_path)
+            match = re.match(r"frame_(\d+)\.ply$", name)
+            if not match:
+                continue
+            session_started_at = getattr(self.training_manager, "session_started_at", 0.0)
+            if session_started_at > 0.0:
+                try:
+                    if os.path.getmtime(ply_path) + 1e-6 < session_started_at:
+                        continue
+                except OSError:
+                    continue
+            iteration = int(match.group(1))
+            if iteration > latest_iter:
+                latest_iter = iteration
+                latest_ply = ply_path
+
+        if latest_ply is None or latest_iter <= self._last_loaded_iteration:
+            return
+        self._load_training_ply(latest_ply, latest_iter)
     
     def _on_training_iteration(self, status: dict):
         """训练迭代回调"""
@@ -2248,24 +2557,28 @@ class MainWindow(QMainWindow):
     
     def _on_training_complete(self):
         """训练完成回调"""
+        self.training_complete_requested.emit()
+
+    def _handle_training_complete(self):
+        """在主线程中处理训练完成。"""
         self._training_update_timer.stop()
         self.left_panel.set_training_active(False)
         # 隐藏训练信息
         self.right_panel.update_training_info(status=None)
-        # 使用QTimer在主线程中显示消息
-        QTimer.singleShot(0, lambda: self.toast.show_message("训练完成！", 3000))
-        QTimer.singleShot(0, lambda: self._set_last_event("训练完成"))
+        self.toast.show_message("训练完成！", 3000)
+        self._set_last_event("训练完成")
     
     def _on_training_error(self, error_msg: str):
         """训练错误回调"""
+        self.training_error_requested.emit(error_msg)
+
+    def _handle_training_error(self, error_msg: str):
+        """在主线程中处理训练错误。"""
         self._training_update_timer.stop()
         self.left_panel.set_training_active(False)
         # 隐藏训练信息
         self.right_panel.update_training_info(status=None)
-        # 使用QTimer在主线程中显示错误
-        QTimer.singleShot(0, lambda: QMessageBox.critical(
-            self, "训练错误", f"训练过程中发生错误:\n{error_msg}"
-        ))
+        QMessageBox.critical(self, "训练错误", f"训练过程中发生错误:\n{error_msg}")
 
     def _export_current_frame_ply(self):
         scene_base = self._scene_name().replace(os.sep, "_")
@@ -2387,6 +2700,8 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _scene_name(self) -> str:
+        if self.pc is None:
+            return "空白场景"
         if self.seq:
             return os.path.basename(os.path.abspath(self.seq.sequence_dir))
         if getattr(self.pc, "ply_path", None):
@@ -2503,7 +2818,7 @@ def _build_objects(args):
     # 允许空白启动（无输入文件）
     if not input_path and not getattr(args, 'model_path', None):
         print("提示: 未指定输入文件，启动空白窗口")
-        print("      可以通过菜单 文件 -> 加载序列/PLY 来加载数据")
+        print("      可以通过左侧面板选择训练数据")
         
         # 创建默认/空白状态
         render_w, render_h = 1080, 720
@@ -2513,45 +2828,7 @@ def _build_objects(args):
             except ValueError as e:
                 print(f"分辨率参数错误: {e}"); sys.exit(1)
         
-        # 创建最小的空点云PLY文件
-        import tempfile
-        from plyfile import PlyData, PlyElement
-        import numpy as np
-        
-        temp_dir = tempfile.gettempdir()
-        temp_ply = os.path.join(temp_dir, "4dgs_empty.ply")
-        
-        # 创建单个点，使用简单的方式避免内存对齐问题
-        vertices = np.zeros(1, dtype=[
-            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
-            ('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4'),
-            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
-        ])
-        vertices['x'][0] = 0.0
-        vertices['y'][0] = 0.0
-        vertices['z'][0] = 0.0
-        vertices['nx'][0] = 0.0
-        vertices['ny'][0] = 0.0
-        vertices['nz'][0] = 1.0
-        vertices['red'][0] = 0
-        vertices['green'][0] = 0
-        vertices['blue'][0] = 0
-        
-        # 复制一份确保内存连续
-        vertices = np.ascontiguousarray(vertices)
-        
-        vertex_element = PlyElement.describe(vertices, 'vertex')
-        PlyData([vertex_element]).write(temp_ply)
-        
-        ply_path = temp_ply
-        config = {'sh_degree': 0, 'white_background': False}
-        sh_degree = 0
-        seq_mgr = None
-        
-        # 创建空点云
-        pc = GaussianPointCloud(ply_path, sh_degree=sh_degree, max_gaussians=None)
-        
-        # 创建默认相机
+        # 【关键修改】不创建任何点云，直接返回空状态
         bg_color = [0, 0, 0]
         camera = InteractiveCamera(
             render_w, render_h,
@@ -2560,10 +2837,9 @@ def _build_objects(args):
             scene_extent=1.0,
         )
         
-        renderer = GaussianRenderer(pc, bg_color=bg_color)
-        renderer.set_render_mode(getattr(args, 'display_mode', GaussianRenderer.RENDER_MODE_SPLAT))
-        
-        return renderer, camera, seq_mgr, render_w, render_h
+        # 不创建点云和渲染器，让MainWindow处理空状态
+        print("[启动] ✓ 空白模式：无点云，等待用户加载数据")
+        return None, camera, None, render_w, render_h
 
     if input_path:
         if os.path.isdir(input_path):
