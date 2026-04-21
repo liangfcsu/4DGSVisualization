@@ -187,6 +187,12 @@ class TrainingManager:
                 # 定时更新状态（避免更新太频繁）
                 current_time = time.time()
                 if current_time - last_update_time >= 0.5:  # 每0.5秒更新一次
+                    # 同时检查是否有新的PLY文件（不仅仅在保存时检查）
+                    if enable_visualization:
+                        check_counter += 1
+                        if check_counter >= 4:  # 每2秒检查一次（0.5s * 4 = 2s）
+                            self._check_for_new_ply()
+                            check_counter = 0
                     last_update_time = current_time
                     
                     if self.current_iteration > 0:
@@ -287,7 +293,7 @@ class TrainingManager:
             
             # 检查是否已经加载过这个迭代
             if latest_iter <= self.last_loaded_iteration:
-                print(f"[检查PLY] 迭代 {latest_iter} 已加载，跳过")
+                # print(f"[检查PLY] 迭代 {latest_iter} 已加载，跳过")  # 减少日志
                 return
             
             # 查找PLY文件
@@ -303,27 +309,15 @@ class TrainingManager:
             # 调用回调函数
             if self.on_visualization_update_callback:
                 print(f"[检查PLY] 调用可视化回调...")
-                self.on_visualization_update_callback(ply_path, latest_iter)
-                print(f"[检查PLY] ✓ 可视化更新回调已完成")
+                try:
+                    self.on_visualization_update_callback(ply_path, latest_iter)
+                    print(f"[检查PLY] ✓ 可视化更新回调已完成")
+                except Exception as e:
+                    print(f"[检查PLY] ⚠ 回调执行失败: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
                 print(f"[检查PLY] ⚠ 警告: 可视化回调未设置！")
-            
-            print(f"[检查PLY] 找到 {len(iterations)} 个checkpoint，最新: iteration {latest_iter}")
-            
-            # 如果是新的迭代，加载PLY文件
-            if latest_iter > self.last_loaded_iteration:
-                ply_path = os.path.join(latest_dir, "point_cloud.ply")
-                if os.path.exists(ply_path):
-                    self.last_loaded_iteration = latest_iter
-                    print(f"[检查PLY] 检测到新的checkpoint: iteration {latest_iter}")
-                    print(f"[检查PLY] PLY文件路径: {ply_path}")
-                    if self.on_visualization_update_callback:
-                        print(f"[检查PLY] 调用可视化更新回调...")
-                        self.on_visualization_update_callback(ply_path, latest_iter)
-                else:
-                    print(f"[检查PLY] PLY文件不存在: {ply_path}")
-            else:
-                print(f"[检查PLY] 没有新的checkpoint（当前: {self.last_loaded_iteration}, 最新: {latest_iter}）")
         
         except Exception as e:
             print(f"[检查PLY] 检查PLY文件时出错: {e}")

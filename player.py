@@ -2191,36 +2191,46 @@ class MainWindow(QMainWindow):
     def _load_training_ply(self, ply_path: str, iteration: int):
         """加载训练中的PLY文件到渲染器"""
         try:
-            print(f"[可视化] 尝试加载训练PLY: 迭代 {iteration}, 文件: {ply_path}")
+            print(f"[可视化] ========================================")
+            print(f"[可视化] 尝试加载训练PLY: 迭代 {iteration}")
+            print(f"[可视化] 文件: {ply_path}")
             
             if not os.path.exists(ply_path):
-                print(f"[可视化] 文件不存在: {ply_path}")
+                print(f"[可视化] ❌ 文件不存在: {ply_path}")
                 return
             
             # 避免重复加载
             if self._last_loaded_ply == ply_path:
-                print(f"[可视化] 文件已加载，跳过")
+                print(f"[可视化] ⚠ 文件已加载，跳过")
                 return
             
             self._last_loaded_ply = ply_path
             
             # 加载新的点云
-            print(f"[可视化] 开始加载点云...")
-            self.pc = GaussianPointCloud(ply_path, sh_degree=3, max_gaussians=None)
-            self.renderer.pc = self.pc
-            print(f"[可视化] 点云加载成功，点数: {self.pc.get_xyz.shape[0]:,}")
+            print(f"[可视化] 🔄 开始加载点云...")
+            new_pc = GaussianPointCloud(ply_path, sh_degree=3, max_gaussians=None)
+            print(f"[可视化] ✓ 点云创建成功，点数: {new_pc.get_xyz.shape[0]:,}")
+            
+            # 更新渲染器的点云引用
+            self.pc = new_pc
+            self.renderer.pc = new_pc
+            print(f"[可视化] ✓ 渲染器已更新")
             
             # 更新窗口标题显示当前迭代
             base_title = self.windowTitle().split(' [')[0]  # 移除旧的迭代标记
             self.setWindowTitle(f"{base_title} [训练迭代: {iteration}]")
+            print(f"[可视化] ✓ 窗口标题已更新")
             
-            # 请求渲染
+            # 强制请求渲染
+            self._needs_render = True
             self._request_render()
-            print(f"[可视化] 渲染请求已发送")
+            print(f"[可视化] ✓ 渲染请求已发送 (_needs_render={self._needs_render})")
             
             # 显示提示
             if iteration % 500 == 0:  # 每500次迭代显示一次提示
-                self.toast.show_message(f"训练进度: {iteration} 次迭代，点数: {self.pc.get_xyz.shape[0]:,}", 2000)
+                self.toast.show_message(f"✓ 训练进度: {iteration} 次迭代，点数: {new_pc.get_xyz.shape[0]:,}", 3000)
+            
+            print(f"[可视化] ========================================")
             
         except Exception as e:
             print(f"[可视化] 加载训练PLY失败: {e}")
