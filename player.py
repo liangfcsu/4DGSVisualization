@@ -156,6 +156,7 @@ class RenderView(QWidget):
         self.setStyleSheet("background-color: #000;")
 
         self.camera: InteractiveCamera = None
+        self.renderer = None  # 渲染器引用，用于拾取3D点
         self._pixmap: QPixmap = None
         self._image_buffer: np.ndarray | None = None
         self._scaled_pixmap: QPixmap | None = None
@@ -170,6 +171,7 @@ class RenderView(QWidget):
         self._mid   = False
         self._last_pos = None
         self._trackball_ratio = 0.75
+        self._rotation_pivot = None  # 旋转中心点
         self._selection_mode = False
         self._selection_drag = False
         self._selection_start = None
@@ -374,7 +376,20 @@ class RenderView(QWidget):
             e.accept()
             return
         b = e.button()
-        if   b == Qt.LeftButton:   self._left  = True
+        if   b == Qt.LeftButton:
+            self._left  = True
+            # 尝试拾取鼠标位置的3D点作为旋转中心
+            if self._point_inside_image(e.pos()) and hasattr(self, 'renderer') and self.renderer:
+                norm_pos = self._widget_point_to_norm((e.pos().x(), e.pos().y()))
+                if norm_pos:
+                    picked_idx = self.renderer.pick_point(self.camera, norm_pos[0], norm_pos[1])
+                    if picked_idx is not None and hasattr(self.renderer.pc, 'get_xyz'):
+                        xyz = self.renderer.pc.get_xyz
+                        if xyz is not None and picked_idx < xyz.shape[0]:
+                            self._rotation_pivot = xyz[picked_idx].detach().cpu().numpy()
+                            # 更新相机的旋转中心
+                            if hasattr(self.camera, 'set_rotation_pivot'):
+                                self.camera.set_rotation_pivot(self._rotation_pivot)
         elif b == Qt.RightButton:  self._right = True
         elif b == Qt.MiddleButton: self._mid   = True
         self._last_pos = e.pos()
@@ -410,7 +425,12 @@ class RenderView(QWidget):
             e.accept()
             return
         b = e.button()
-        if   b == Qt.LeftButton:   self._left  = False
+        if   b == Qt.LeftButton:
+            self._left  = False
+            # 释放左键时清除旋转中心
+            self._rotation_pivot = None
+            if hasattr(self.camera, 'clear_rotation_pivot'):
+                self.camera.clear_rotation_pivot()
         elif b == Qt.RightButton:  self._right = False
         elif b == Qt.MiddleButton: self._mid   = False
         if not (self._left or self._right or self._mid):
@@ -444,8 +464,12 @@ class RenderView(QWidget):
         else:
             # FPS / Orbit 模式: 左键旋转, 右键平移(抓取式), 中键前后
             if self._left:
-                self.camera.rotate_yaw(dx * 0.3)
-                self.camera.rotate_pitch(-dy * 0.3)
+                # 如果有自定义旋转中心，使用orbit旋转；否则原地旋转
+                if self._rotation_pivot is not None and hasattr(self.camera, 'orbit_rotate'):
+                    self.camera.orbit_rotate(dx, dy)
+                else:
+                    self.camera.rotate_yaw(dx * 0.3)
+                    self.camera.rotate_pitch(-dy * 0.3)
             if self._right:
                 self.camera.move_right(-dx * 0.1)
                 self.camera.move_up(dy * 0.1)
@@ -573,15 +597,15 @@ class MainWindow(QMainWindow):
         a = QAction("反选", self); a.setShortcut("Ctrl+I"); a.triggered.connect(self._invert_selection)
         em.addAction(a)
         em.addSeparator()
-        a = QAction("隐藏选中", self); a.setShortcut("Shift+H"); a.triggered.connect(self._hide_selected)
+        a = QAction("隐藏选中", self); a.triggered.connect(self._hide_selected)
         em.addAction(a)
-        a = QAction("恢复隐藏", self); a.setShortcut("Shift+U"); a.triggered.connect(self._unhide_all)
+        a = QAction("恢复隐藏", self); a.triggered.connect(self._unhide_all)
         em.addAction(a)
-        a = QAction("删除选中", self); a.setShortcut("Delete"); a.triggered.connect(self._delete_selected)
+        a = QAction("删除选中", self); a.triggered.connect(self._delete_selected)
         em.addAction(a)
-        a = QAction("反向删除（删除未选中）", self); a.setShortcut("Shift+Delete"); a.triggered.connect(self._delete_unselected)
+        a = QAction("反向删除（删除未选中）", self); a.triggered.connect(self._delete_unselected)
         em.addAction(a)
-        a = QAction("恢复删除", self); a.setShortcut("Shift+R"); a.triggered.connect(self._restore_deleted)
+        a = QAction("恢复删除", self); a.triggered.connect(self._restore_deleted)
         em.addAction(a)
 
         vm = mb.addMenu("视图(&V)")
@@ -639,6 +663,7 @@ class MainWindow(QMainWindow):
         # Viewport
         self.view = RenderView()
         self.view.set_camera(self.camera)
+        self.view.renderer = self.renderer  # 设置渲染器引用
         self.view.set_interaction_callback(self._request_render)
         self.view.set_selection_callback(self._handle_view_selection)
         middle_hl.addWidget(self.view, stretch=1)
@@ -1615,13 +1640,13 @@ class MainWindow(QMainWindow):
 &nbsp;&nbsp;<b>G</b> — 循环切换 (RGB / Gaussian / Ring)<br><br>
 
 <b>鼠标操作 (FPS/Orbit 模式)</b><br>
-&nbsp;&nbsp;<b>左键拖动</b> — 旋转视角<br>
+&nbsp;&nbsp;<b>左键拖动</b> — 旋转视角（点击高斯点可围绕该点旋转）<br>
 &nbsp;&nbsp;<b>右键拖动</b> — 平移<br>
 &nbsp;&nbsp;<b>中键拖动</b> — 前后移动<br>
 &nbsp;&nbsp;<b>滚轮</b> — 缩放<br><br>
 
 <b>鼠标操作 (Trackball 模式)</b><br>
-&nbsp;&nbsp;<b>左键中心</b> — 球面旋转 &nbsp; <b>左键边缘</b> — 滚转<br>
+&nbsp;&nbsp;<b>左键中心</b> — 球面旋转（点击高斯点可围绕该点旋转） &nbsp; <b>左键边缘</b> — 滚转<br>
 &nbsp;&nbsp;<b>右键中心</b> — 平移 &nbsp; <b>右键边缘</b> — 缩放<br><br>
 
 <b>高斯选择 / 编辑</b><br>

@@ -2989,6 +2989,24 @@ class InteractiveCamera:
         # Trackball参数
         self.trackball_center = self.scene_center.copy()
         self.trackball_radius = scene_extent * 0.5
+        
+        # 动态旋转中心（用于基于鼠标点击的旋转）
+        self._custom_rotation_pivot = None
+    
+    def set_rotation_pivot(self, pivot):
+        """设置自定义旋转中心点"""
+        if pivot is not None:
+            self._custom_rotation_pivot = np.array(pivot, dtype=np.float32)
+    
+    def clear_rotation_pivot(self):
+        """清除自定义旋转中心"""
+        self._custom_rotation_pivot = None
+    
+    def get_rotation_center(self):
+        """获取当前旋转中心（优先使用自定义pivot）"""
+        if self._custom_rotation_pivot is not None:
+            return self._custom_rotation_pivot
+        return self.trackball_center
     
     def _axis_angle_to_rotation(self, axis, angle):
         """将轴角表示转换为旋转矩阵 (Rodrigues公式)"""
@@ -3158,6 +3176,32 @@ class InteractiveCamera:
         self.R = self.R @ dR_cam
         self.current_camera_idx = -1
     
+    def orbit_rotate(self, dx, dy):
+        """Orbit模式旋转：围绕旋转中心旋转相机"""
+        angle_yaw = dx * self.mouse_sensitivity
+        angle_pitch = -dy * self.mouse_sensitivity
+        
+        rotation_center = self.get_rotation_center()
+        
+        # Yaw: 绕世界Y轴（或相机Y轴）
+        axis_yaw = np.array([0, 1, 0], dtype=np.float32)
+        dR_yaw = self._axis_angle_to_rotation(axis_yaw, angle_yaw)
+        
+        # Pitch: 绕相机X轴
+        axis_pitch = np.array([1, 0, 0], dtype=np.float32)
+        dR_pitch = self._axis_angle_to_rotation(axis_pitch, angle_pitch)
+        
+        # 应用旋转
+        self.R = self.R @ dR_yaw @ dR_pitch
+        
+        # 更新位置使其绕中心旋转
+        offset = self.position - rotation_center
+        dist = np.linalg.norm(offset)
+        
+        forward = self.R[:, 2]
+        self.position = rotation_center - forward * dist
+        self.current_camera_idx = -1
+    
     # === Trackball模式 ===
     def trackball_rotate(self, dx, dy):
         """Trackball球面旋转 (鼠标左键中心区域)"""
@@ -3175,11 +3219,16 @@ class InteractiveCamera:
         # 应用旋转
         self.R = self.R @ dR_yaw @ dR_pitch
         
+        # 使用动态旋转中心（如果有自定义pivot则使用，否则使用默认中心）
+        rotation_center = self.get_rotation_center()
+        
         # 更新位置使其绕中心旋转
-        offset = self.position - self.trackball_center
+        offset = self.position - rotation_center
         dist = np.linalg.norm(offset)
         
         forward = self.R[:, 2]  # 相机前方(列)
+        self.position = rotation_center - forward * dist
+        self.current_camera_idx = -1
         self.position = self.trackball_center - forward * dist
         self.current_camera_idx = -1
     
