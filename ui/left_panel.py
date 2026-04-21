@@ -44,6 +44,8 @@ class LeftControlPanel(QWidget):
     restore_deleted_clicked = pyqtSignal()
     load_sequence_clicked   = pyqtSignal()
     load_camera_clicked     = pyqtSignal()
+    start_training_clicked  = pyqtSignal(str, str, int)  # source_path, model_path, iterations
+    stop_training_clicked   = pyqtSignal()
 
     def __init__(self, state: UIState, cameras_info=None, parent=None):
         super().__init__(parent)
@@ -87,42 +89,13 @@ class LeftControlPanel(QWidget):
         outer.addWidget(scroll, stretch=1)
 
         self._build_file_section()
+        self._build_training_section()
         self._build_display_section()
         self._build_gaussian_section()
         self._build_selection_section()
         self._build_camera_section()
         self._layout.addStretch()
 
-    # ── File Loading Section ──────────────────────────────────────────────
-
-    def _build_file_section(self):
-        sec = CollapsibleSection("文件加载", expanded=False)
-        cl = sec.content_layout
-
-        # Load sequence button
-        load_seq_btn = QPushButton("加载点云序列")
-        load_seq_btn.setToolTip("选择PLY序列文件夹或单个PLY文件")
-        load_seq_btn.clicked.connect(self.load_sequence_clicked.emit)
-        cl.addWidget(load_seq_btn)
-
-        # Load camera button
-        load_cam_btn = QPushButton("加载相机参数")
-        load_cam_btn.setToolTip("选择COLMAP sparse/0文件夹")
-        load_cam_btn.clicked.connect(self.load_camera_clicked.emit)
-        cl.addWidget(load_cam_btn)
-        
-        # Current files info
-        self.current_seq_label = QLabel("序列: 未加载")
-        self.current_seq_label.setWordWrap(True)
-        self.current_seq_label.setObjectName("SectionLabel")
-        cl.addWidget(self.current_seq_label)
-        
-        self.current_cam_label = QLabel("相机: 未加载")
-        self.current_cam_label.setWordWrap(True)
-        self.current_cam_label.setObjectName("SectionLabel")
-        cl.addWidget(self.current_cam_label)
-
-        self._layout.addWidget(sec)
     # ── File Loading Section ──────────────────────────────────────────────
 
     def _build_file_section(self):
@@ -200,6 +173,142 @@ class LeftControlPanel(QWidget):
         cl.addLayout(row2)
 
         self._layout.addWidget(sec)
+
+    # ── Training Section ──────────────────────────────────────────────────
+
+    def _build_training_section(self):
+        sec = CollapsibleSection("训练控制", expanded=False)
+        cl = sec.content_layout
+
+        # Source path
+        cl.addWidget(self._lbl("训练数据路径"))
+        self.training_source_path = QLabel("未选择")
+        self.training_source_path.setWordWrap(True)
+        self.training_source_path.setObjectName("SectionLabel")
+        cl.addWidget(self.training_source_path)
+        
+        btn_select_source = QPushButton("选择训练数据")
+        btn_select_source.setToolTip("选择包含images和sparse文件夹的训练数据目录")
+        btn_select_source.clicked.connect(self._select_training_source)
+        cl.addWidget(btn_select_source)
+        
+        cl.addWidget(Separator())
+        
+        # Output path
+        cl.addWidget(self._lbl("输出路径"))
+        self.training_output_path = QLabel("未选择")
+        self.training_output_path.setWordWrap(True)
+        self.training_output_path.setObjectName("SectionLabel")
+        cl.addWidget(self.training_output_path)
+        
+        btn_select_output = QPushButton("选择输出目录")
+        btn_select_output.setToolTip("选择训练结果保存目录")
+        btn_select_output.clicked.connect(self._select_training_output)
+        cl.addWidget(btn_select_output)
+        
+        cl.addWidget(Separator())
+        
+        # Iterations
+        row_iter = QHBoxLayout()
+        row_iter.addWidget(self._lbl("迭代次数"))
+        self.training_iterations = QDoubleSpinBox()
+        self.training_iterations.setRange(1000, 100000)
+        self.training_iterations.setValue(30000)
+        self.training_iterations.setDecimals(0)
+        self.training_iterations.setSingleStep(1000)
+        self.training_iterations.setToolTip("训练迭代次数")
+        row_iter.addWidget(self.training_iterations)
+        cl.addLayout(row_iter)
+        
+        cl.addWidget(Separator())
+        
+        # Training status
+        self.training_status = QLabel("状态: 未开始")
+        self.training_status.setObjectName("SectionLabel")
+        cl.addWidget(self.training_status)
+        
+        self.training_progress = QLabel("进度: 0 / 0")
+        self.training_progress.setObjectName("SectionLabel")
+        cl.addWidget(self.training_progress)
+        
+        self.training_loss = QLabel("Loss: -")
+        self.training_loss.setObjectName("SectionLabel")
+        cl.addWidget(self.training_loss)
+        
+        self.training_points = QLabel("点数: -")
+        self.training_points.setObjectName("SectionLabel")
+        cl.addWidget(self.training_points)
+        
+        cl.addWidget(Separator())
+        
+        # Control buttons
+        self.btn_start_training = QPushButton("▶ 开始训练")
+        self.btn_start_training.setToolTip("开始3DGS训练")
+        self.btn_start_training.clicked.connect(self._on_start_training)
+        cl.addWidget(self.btn_start_training)
+        
+        self.btn_stop_training = QPushButton("⏹ 停止训练")
+        self.btn_stop_training.setToolTip("停止训练")
+        self.btn_stop_training.clicked.connect(self.stop_training_clicked.emit)
+        self.btn_stop_training.setEnabled(False)
+        cl.addWidget(self.btn_stop_training)
+
+        self._layout.addWidget(sec)
+        
+        # Store paths
+        self._training_source = None
+        self._training_output = None
+    
+    def _select_training_source(self):
+        from PyQt5.QtWidgets import QFileDialog
+        dir_path = QFileDialog.getExistingDirectory(
+            self,
+            "选择训练数据目录",
+            "",
+            QFileDialog.ShowDirsOnly
+        )
+        if dir_path:
+            self._training_source = dir_path
+            import os
+            self.training_source_path.setText(os.path.basename(dir_path))
+    
+    def _select_training_output(self):
+        from PyQt5.QtWidgets import QFileDialog
+        dir_path = QFileDialog.getExistingDirectory(
+            self,
+            "选择输出目录",
+            "",
+            QFileDialog.ShowDirsOnly
+        )
+        if dir_path:
+            self._training_output = dir_path
+            import os
+            self.training_output_path.setText(os.path.basename(dir_path))
+    
+    def _on_start_training(self):
+        if not self._training_source or not self._training_output:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "参数缺失", "请先选择训练数据路径和输出路径")
+            return
+        
+        iterations = int(self.training_iterations.value())
+        self.start_training_clicked.emit(self._training_source, self._training_output, iterations)
+    
+    def update_training_status(self, status: str, iteration: int = 0, total: int = 0, 
+                              loss: float = 0.0, num_points: int = 0):
+        """更新训练状态显示"""
+        self.training_status.setText(f"状态: {status}")
+        if total > 0:
+            self.training_progress.setText(f"进度: {iteration} / {total}")
+        if loss > 0:
+            self.training_loss.setText(f"Loss: {loss:.6f}")
+        if num_points > 0:
+            self.training_points.setText(f"点数: {num_points:,}")
+    
+    def set_training_active(self, active: bool):
+        """设置训练按钮状态"""
+        self.btn_start_training.setEnabled(not active)
+        self.btn_stop_training.setEnabled(active)
 
     # ── Gaussian Section ──────────────────────────────────────────────────
 

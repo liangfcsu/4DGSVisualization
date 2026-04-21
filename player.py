@@ -903,6 +903,18 @@ class MainWindow(QMainWindow):
         self.render_w   = render_w
         self.render_h   = render_h
         self._preferred_frame_device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # ── Training Manager ──
+        from training_manager import TrainingManager
+        self.training_manager = TrainingManager()
+        self.training_manager.on_iteration_callback = self._on_training_iteration
+        self.training_manager.on_complete_callback = self._on_training_complete
+        self.training_manager.on_error_callback = self._on_training_error
+        self.training_manager.on_visualization_update_callback = self._on_training_visualization_update
+        self._training_update_timer = QTimer()
+        self._training_update_timer.timeout.connect(self._update_training_status)
+        self._training_visualization_enabled = True
+        self._last_loaded_ply = None
 
         # ── Runtime state ──
         self._fps_avg      = 0.0
@@ -1182,6 +1194,8 @@ class MainWindow(QMainWindow):
         self.left_panel.restore_deleted_clicked.connect(self._restore_deleted)
         self.left_panel.load_sequence_clicked.connect(self._load_sequence)
         self.left_panel.load_camera_clicked.connect(self._load_camera_params)
+        self.left_panel.start_training_clicked.connect(self._start_training)
+        self.left_panel.stop_training_clicked.connect(self._stop_training)
 
         # ── Bottom Bar ──
         if self.seq:
@@ -2075,6 +2089,119 @@ class MainWindow(QMainWindow):
             print(f"加载相机参数失败: {e}")
             import traceback
             traceback.print_exc()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Training Management
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    def _start_training(self, source_path: str, model_path: str, iterations: int):
+        """开始训练"""
+        try:
+            self.toast.show_message("正在启动训练...", 2000)
+            self.training_manager.start_training(
+                source_path=source_path,
+                model_path=model_path,
+                iterations=iterations,
+                enable_visualization=self._training_visualization_enabled
+            )
+            self.left_panel.set_training_active(True)
+            self._training_update_timer.start(100)  # 每100ms更新一次
+            self._set_last_event(f"训练已启动: {iterations} 次迭代（实时可视化已开启）")
+            self.toast.show_message("训练已启动，正在实时显示训练过程...", 3000)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "训练启动失败", f"无法启动训练:\n{str(e)}")
+            print(f"训练启动失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _stop_training(self):
+        """停止训练"""
+        self.training_manager.stop_training()
+        self._training_update_timer.stop()
+        self.left_panel.set_training_active(False)
+        self.toast.show_message("训练已停止", 2000)
+        self._set_last_event("训练已停止")
+        self._last_loaded_ply = None
+    
+    def _update_training_status(self):
+        """更新训练状态（定时器回调）"""
+        statuses = self.training_manager.get_status()
+        for status in statuses:
+            msg = status['message']
+            data = status.get('data', {})
+            
+            self.left_panel.update_training_status(
+                status=msg,
+                iteration=data.get('iteration', 0),
+                total=data.get('total', 0),
+                loss=data.get('loss', 0.0),
+                num_points=data.get('num_points', 0)
+            )
+    
+    def _on_training_visualization_update(self, ply_path: str, iteration: int):
+        """训练可视化更新回调 - 在训练线程中调用"""
+        # 使用QTimer在主线程中更新UI
+        QTimer.singleShot(0, lambda: self._load_training_ply(ply_path, iteration))
+    
+    def _load_training_ply(self, ply_path: str, iteration: int):
+        """加载训练中的PLY文件到渲染器"""
+        try:
+            if not os.path.exists(ply_path):
+                return
+            
+            # 避免重复加载
+            if self._last_loaded_ply == ply_path:
+                return
+            
+            self._last_loaded_ply = ply_path
+            
+            # 加载新的点云
+            print(f"加载训练可视化: 迭代 {iteration}, 文件: {ply_path}")
+            self.pc = GaussianPointCloud(ply_path, sh_degree=3, max_gaussians=None)
+            self.renderer.pc = self.pc
+            
+            # 更新窗口标题显示当前迭代
+            base_title = self.windowTitle().split(' [')[0]  # 移除旧的迭代标记
+            self.setWindowTitle(f"{base_title} [训练迭代: {iteration}]")
+            
+            # 请求渲染
+            self._request_render()
+            
+            # 显示提示
+            if iteration % 500 == 0:  # 每500次迭代显示一次提示
+                self.toast.show_message(f"训练进度: {iteration} 次迭代，点数: {self.pc.xyz.shape[0]:,}", 2000)
+            
+        except Exception as e:
+            print(f"加载训练PLY失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _update_training_visualization(self):
+        """更新训练可视化（已被 _on_training_visualization_update 替代）"""
+        pass
+    
+    def _on_training_iteration(self, status: dict):
+        """训练迭代回调"""
+        # 这个回调在训练线程中执行，不要直接更新UI
+        pass
+    
+    def _on_training_complete(self):
+        """训练完成回调"""
+        self._training_update_timer.stop()
+        self.left_panel.set_training_active(False)
+        # 使用QTimer在主线程中显示消息
+        QTimer.singleShot(0, lambda: self.toast.show_message("训练完成！", 3000))
+        QTimer.singleShot(0, lambda: self._set_last_event("训练完成"))
+    
+    def _on_training_error(self, error_msg: str):
+        """训练错误回调"""
+        self._training_update_timer.stop()
+        self.left_panel.set_training_active(False)
+        # 使用QTimer在主线程中显示错误
+        QTimer.singleShot(0, lambda: QMessageBox.critical(
+            self, "训练错误", f"训练过程中发生错误:\n{error_msg}"
+        ))
 
     def _export_current_frame_ply(self):
         scene_base = self._scene_name().replace(os.sep, "_")
