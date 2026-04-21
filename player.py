@@ -175,6 +175,7 @@ class RenderView(QWidget):
         self._selection_start = None
         self._selection_current = None
         self._selection_overlay_points = []
+        self._persistent_selection_rect = None
 
         # Overlay references (set by MainWindow)
         self._overlay = None
@@ -199,6 +200,10 @@ class RenderView(QWidget):
 
     def set_selection_overlay_points(self, points):
         self._selection_overlay_points = list(points or [])
+        self.update()
+
+    def set_persistent_selection_rect(self, rect_norm):
+        self._persistent_selection_rect = rect_norm
         self.update()
 
     def is_interacting(self):
@@ -263,6 +268,18 @@ class RenderView(QWidget):
             w = abs(self._selection_start[0] - self._selection_current[0])
             h = abs(self._selection_start[1] - self._selection_current[1])
             painter.drawRect(int(x0), int(y0), int(w), int(h))
+        elif self._image_rect and self._persistent_selection_rect:
+            x0, y0, w, h = self._image_rect
+            start_norm, end_norm = self._persistent_selection_rect
+            rx0 = x0 + min(start_norm[0], end_norm[0]) * w
+            ry0 = y0 + min(start_norm[1], end_norm[1]) * h
+            rw = abs(end_norm[0] - start_norm[0]) * w
+            rh = abs(end_norm[1] - start_norm[1]) * h
+            pen = QPen(QColor(80, 200, 255, 230))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.setBrush(QColor(80, 200, 255, 28))
+            painter.drawRect(int(rx0), int(ry0), int(rw), int(rh))
 
     def resizeEvent(self, event):
         self._scaled_pixmap = None
@@ -456,6 +473,8 @@ class MainWindow(QMainWindow):
         self._last_event   = ""
         self._update_counter = 0
         self._pending_seek_preview = None
+        self._sticky_rect_selection = None
+        self._sticky_rect_selection_op = "set"
 
         # ── UI State ──
         self.ui_state = UIState()
@@ -659,6 +678,7 @@ class MainWindow(QMainWindow):
             self.ui_state.scene_name, self.ui_state.vis_mode, cam_label
         )
         self.view.set_selection_mode(self.ui_state.selection_mode)
+        self.view.set_persistent_selection_rect(self._sticky_rect_selection)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Signal Connections
@@ -765,6 +785,30 @@ class MainWindow(QMainWindow):
     def _request_render(self):
         self._needs_render = True
 
+    def _set_sticky_rect_selection(self, rect_payload, op="set"):
+        if rect_payload is None:
+            self._sticky_rect_selection = None
+            self._sticky_rect_selection_op = "set"
+        else:
+            start_norm, end_norm = rect_payload
+            self._sticky_rect_selection = (
+                (float(start_norm[0]), float(start_norm[1])),
+                (float(end_norm[0]), float(end_norm[1])),
+            )
+            self._sticky_rect_selection_op = op
+        self.view.set_persistent_selection_rect(self._sticky_rect_selection)
+
+    def _clear_sticky_rect_selection(self):
+        self._set_sticky_rect_selection(None, op="set")
+
+    def _reapply_sticky_rect_selection(self):
+        if not self._sticky_rect_selection:
+            return False
+        start_norm, end_norm = self._sticky_rect_selection
+        indices = self.renderer.pick_rect(self.camera, start_norm, end_norm)
+        self.pc.apply_selection_indices(indices, op=self._sticky_rect_selection_op)
+        return True
+
     def _on_render(self):
         try:
             frame_updated = False
@@ -844,6 +888,7 @@ class MainWindow(QMainWindow):
         if self.seq:
             frame = self.seq.get_current_frame_data(prefer_device=self._preferred_frame_device)
             self.pc.apply_frame(frame)
+            self._reapply_sticky_rect_selection()
             self._pending_seek_preview = None
         self._request_render()
 
@@ -862,6 +907,7 @@ class MainWindow(QMainWindow):
             return False
         frame = self.seq.get_current_frame_data(prefer_device=self._preferred_frame_device)
         self.pc.apply_frame(frame)
+        self._reapply_sticky_rect_selection()
         self._pending_seek_preview = None
         self._request_render()
         return True
@@ -1176,26 +1222,32 @@ class MainWindow(QMainWindow):
 
     def _handle_view_selection(self, kind: str, op: str, payload):
         if kind == "point":
+            self._clear_sticky_rect_selection()
             idx = self.renderer.pick_point(self.camera, payload[0], payload[1])
             indices = [] if idx is None else [idx]
             action_label = "点选"
         else:
             start_norm, end_norm = payload
+            self._set_sticky_rect_selection((start_norm, end_norm), op=op)
             indices = self.renderer.pick_rect(self.camera, start_norm, end_norm)
             action_label = "框选"
         self.pc.apply_selection_indices(indices, op=op)
         op_label = {"set": "设置", "add": "添加", "remove": "移除"}.get(op, op)
-        self._apply_selection_feedback(f"{action_label}{op_label}")
+        extra = " · 已记住框区域并在换帧时自动沿用" if kind == "rect" else ""
+        self._apply_selection_feedback(f"{action_label}{op_label}{extra}")
 
     def _clear_selection(self):
+        self._clear_sticky_rect_selection()
         self.pc.clear_selection()
         self._apply_selection_feedback("清空选择")
 
     def _select_all(self):
+        self._clear_sticky_rect_selection()
         self.pc.select_all()
         self._apply_selection_feedback("全选可见高斯")
 
     def _invert_selection(self):
+        self._clear_sticky_rect_selection()
         self.pc.invert_selection()
         self._apply_selection_feedback("反选完成")
 
@@ -1424,6 +1476,7 @@ class MainWindow(QMainWindow):
 <b>高斯选择 / 编辑</b><br>
 &nbsp;&nbsp;<b>V</b> — 开关选择模式<br>
 &nbsp;&nbsp;<b>左键单击</b> — 点选高斯 &nbsp; <b>左键拖拽</b> — 框选高斯<br>
+&nbsp;&nbsp;框选区域会在换帧时自动沿用；点选 / 全选 / 清空 / 反选会取消沿用<br>
 &nbsp;&nbsp;<b>Shift</b> — 添加到选择 &nbsp; <b>Ctrl</b> — 从选择中移除<br>
 &nbsp;&nbsp;<b>Ctrl+A</b> — 全选 &nbsp; <b>Ctrl+Shift+A</b> — 清空选择 &nbsp; <b>Ctrl+I</b> — 反选<br>
 &nbsp;&nbsp;<b>Delete</b> — 删除选中 &nbsp; <b>Shift+H</b> — 隐藏选中<br>
