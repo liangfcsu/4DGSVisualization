@@ -38,7 +38,10 @@
 git clone https://github.com/YOUR_USERNAME/4DGSVisualization.git
 cd 4DGSVisualization
 
-# 2. 创建Conda环境
+# 2. 初始化和更新子模块
+git submodule update --init --recursive
+
+# 3. 创建Conda环境
 conda create -n 3dgs python=3.11 -y
 conda activate 3dgs
 
