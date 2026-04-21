@@ -727,10 +727,7 @@ class RenderView(QWidget):
             e.accept()
             return
         b = e.button()
-        if   b == Qt.LeftButton:   
-            self._left  = True
-            # 记录旋转起始位置
-            self._rotation_start_pos = e.pos()
+        if   b == Qt.LeftButton:   self._left  = True
         elif b == Qt.RightButton:  self._right = True
         elif b == Qt.MiddleButton: self._mid   = True
         self._last_pos = e.pos()
@@ -804,13 +801,7 @@ class RenderView(QWidget):
             e.accept()
             return
         b = e.button()
-        if   b == Qt.LeftButton:   
-            self._left  = False
-            # 清除旋转中心缓存
-            if hasattr(self, '_rotation_pivot'):
-                delattr(self, '_rotation_pivot')
-            if hasattr(self, '_rotation_start_pos'):
-                delattr(self, '_rotation_start_pos')
+        if   b == Qt.LeftButton:   self._left  = False
         elif b == Qt.RightButton:  self._right = False
         elif b == Qt.MiddleButton: self._mid   = False
         if not (self._left or self._right or self._mid):
@@ -866,24 +857,10 @@ class RenderView(QWidget):
                 if ic: self.camera.trackball_pan(-dx, dy)
                 else:  self.camera.trackball_zoom(-dy * 0.5)
         else:
-            # FPS / Orbit 模式: 左键旋转(围绕鼠标点击位置), 右键平移(抓取式), 中键前后
+            # FPS / Orbit 模式: 左键旋转, 右键平移(抓取式), 中键前后
             if self._left:
-                # 计算旋转中心（基于初始点击位置）
-                if hasattr(self, '_rotation_pivot'):
-                    # 使用存储的旋转中心
-                    pivot = self._rotation_pivot
-                else:
-                    # 首次旋转，计算旋转中心
-                    pivot = self._calculate_rotation_pivot(self._rotation_start_pos if hasattr(self, '_rotation_start_pos') else e.pos())
-                    self._rotation_pivot = pivot
-                
-                # 围绕旋转中心旋转：向右拖动dx>0→向右看，向上拖动dy<0→向上看
-                if pivot is not None:
-                    self.camera.rotate_around_point(pivot, dx * 0.3, -dy * 0.3)
-                else:
-                    # 如果无法计算旋转中心，使用默认旋转
-                    self.camera.rotate_yaw(dx * 0.3)
-                    self.camera.rotate_pitch(-dy * 0.3)
+                self.camera.rotate_yaw(dx * 0.3)
+                self.camera.rotate_pitch(-dy * 0.3)
             if self._right:
                 self.camera.move_right(-dx * 0.1)
                 self.camera.move_up(dy * 0.1)
