@@ -522,6 +522,7 @@ def get_vertex_data_array(vertex):
 
 
 def read_structured_columns(data, field_names, sample_indices=None):
+    """读取结构化数组的列，如果字段不存在则返回默认值"""
     if sample_indices is not None:
         data = data[sample_indices]
 
@@ -529,6 +530,35 @@ def read_structured_columns(data, field_names, sample_indices=None):
         row_count = len(data)
         return np.empty((row_count, 0), dtype=np.float32)
 
+    # 检查字段是否存在
+    available_fields = data.dtype.names if data.dtype.names else []
+    missing_fields = [f for f in field_names if f not in available_fields]
+    
+    if missing_fields:
+        # 如果缺少字段，返回默认值
+        row_count = len(data)
+        
+        # 为不同类型的字段设置不同的默认值
+        if 'opacity' in missing_fields:
+            # opacity默认为1.0（完全不透明）
+            default_values = np.ones((row_count, len(field_names)), dtype=np.float32)
+        elif any('f_dc' in f or 'f_rest' in f for f in missing_fields):
+            # 特征系数默认为0.0
+            default_values = np.zeros((row_count, len(field_names)), dtype=np.float32)
+        elif any('scale' in f for f in missing_fields):
+            # scale默认为0.001（很小的高斯）
+            default_values = np.full((row_count, len(field_names)), -6.0, dtype=np.float32)  # exp(-6) ≈ 0.0025
+        elif any('rot' in f for f in missing_fields):
+            # rotation默认为单位四元数[1,0,0,0]
+            default_values = np.zeros((row_count, len(field_names)), dtype=np.float32)
+            if len(field_names) >= 1:
+                default_values[:, 0] = 1.0  # w分量为1
+        else:
+            default_values = np.zeros((row_count, len(field_names)), dtype=np.float32)
+        
+        print(f"[警告] PLY文件缺少字段: {missing_fields}，使用默认值")
+        return default_values
+    
     if len(field_names) == 1:
         arr = np.asarray(data[field_names[0]], dtype=np.float32)
         return np.ascontiguousarray(arr.reshape(-1, 1))
@@ -1071,11 +1101,33 @@ class GaussianFrame:
         xyz = read_structured_columns(data, ("x", "y", "z"), sample_indices)
         opacities = read_structured_columns(data, ("opacity",), sample_indices)
 
-        features_dc = read_structured_columns(
-            data,
-            ("f_dc_0", "f_dc_1", "f_dc_2"),
-            sample_indices,
-        )[:, np.newaxis, :]
+        # 尝试读取特征，如果不存在则从RGB转换
+        property_names_list = list(property_names)
+        has_features = any('f_dc' in name for name in property_names_list)
+        has_rgb = all(c in property_names_list for c in ['red', 'green', 'blue'])
+        
+        if has_features:
+            features_dc = read_structured_columns(
+                data,
+                ("f_dc_0", "f_dc_1", "f_dc_2"),
+                sample_indices,
+            )[:, np.newaxis, :]
+        elif has_rgb:
+            # 从RGB转换为SH特征（DC分量）
+            rgb = read_structured_columns(data, ("red", "green", "blue"), sample_indices)
+            # 归一化RGB到[0,1]
+            rgb = rgb / 255.0 if rgb.max() > 1.0 else rgb
+            # 转换为SH DC系数：C0 = (rgb - 0.5) / SH_C0
+            SH_C0 = 0.28209479177387814
+            features_dc = ((rgb - 0.5) / SH_C0).reshape(-1, 1, 3)
+            print(f"[信息] 从RGB转换为SH特征")
+        else:
+            # 使用默认值
+            features_dc = read_structured_columns(
+                data,
+                ("f_dc_0", "f_dc_1", "f_dc_2"),
+                sample_indices,
+            )[:, np.newaxis, :]
 
         extra_coeff_count = max(0, (active_sh_degree + 1) ** 2 - 1)
         if extra_f_names and extra_coeff_count > 0:
@@ -1094,6 +1146,14 @@ class GaussianFrame:
 
         scales = read_structured_columns(data, scale_names, sample_indices)
         rots = read_structured_columns(data, rot_names, sample_indices)
+
+        # 确保所有数组都是C连续的，避免内存对齐问题
+        # 使用.copy()强制创建新的内存布局
+        xyz = np.ascontiguousarray(xyz).copy()
+        features = np.ascontiguousarray(features).copy()
+        opacities = np.ascontiguousarray(opacities).copy()
+        scales = np.ascontiguousarray(scales).copy()
+        rots = np.ascontiguousarray(rots).copy()
 
         xyz_t = cls._maybe_pin(torch.from_numpy(xyz), pin_memory)
         features_t = cls._maybe_pin(torch.from_numpy(features).contiguous(), pin_memory)

@@ -2098,6 +2098,16 @@ class MainWindow(QMainWindow):
         """开始训练"""
         try:
             self.toast.show_message("正在启动训练...", 2000)
+            
+            # 立即加载初始PLY文件进行可视化
+            initial_ply = os.path.join(source_path, "input.ply")
+            if os.path.exists(initial_ply) and self._training_visualization_enabled:
+                print(f"[训练] 加载初始点云: {initial_ply}")
+                self._load_training_ply(initial_ply, 0)
+                self.toast.show_message("初始点云已加载，训练即将开始...", 2000)
+                QApplication.processEvents()
+            
+            # 启动训练
             self.training_manager.start_training(
                 source_path=source_path,
                 model_path=model_path,
@@ -2107,7 +2117,17 @@ class MainWindow(QMainWindow):
             self.left_panel.set_training_active(True)
             self._training_update_timer.start(100)  # 每100ms更新一次
             self._set_last_event(f"训练已启动: {iterations} 次迭代（实时可视化已开启）")
-            self.toast.show_message("训练已启动，正在实时显示训练过程...", 3000)
+            
+            # 显示右侧训练信息面板
+            self.right_panel.update_training_info(
+                status="初始化中...",
+                iteration=0,
+                total=iterations,
+                loss=0.0,
+                num_points=self.pc.get_xyz.shape[0] if self.pc else 0
+            )
+            
+            self.toast.show_message(f"训练已启动！初始点数: {self.pc.get_xyz.shape[0] if self.pc else 0:,}", 3000)
             
         except Exception as e:
             QMessageBox.critical(self, "训练启动失败", f"无法启动训练:\n{str(e)}")
@@ -2120,6 +2140,8 @@ class MainWindow(QMainWindow):
         self.training_manager.stop_training()
         self._training_update_timer.stop()
         self.left_panel.set_training_active(False)
+        # 隐藏训练信息
+        self.right_panel.update_training_info(status=None)
         self.toast.show_message("训练已停止", 2000)
         self._set_last_event("训练已停止")
         self._last_loaded_ply = None
@@ -2127,16 +2149,38 @@ class MainWindow(QMainWindow):
     def _update_training_status(self):
         """更新训练状态（定时器回调）"""
         statuses = self.training_manager.get_status()
+        if not statuses:
+            return
+            
         for status in statuses:
             msg = status['message']
             data = status.get('data', {})
             
+            iteration = data.get('iteration', 0)
+            total = data.get('total', 0)
+            loss = data.get('loss', 0.0)
+            num_points = data.get('num_points', 0)
+            
+            # 如果有当前点云，使用实际点数
+            if num_points == 0 and self.pc:
+                num_points = self.pc.get_xyz.shape[0]
+            
+            # 更新左侧面板
             self.left_panel.update_training_status(
                 status=msg,
-                iteration=data.get('iteration', 0),
-                total=data.get('total', 0),
-                loss=data.get('loss', 0.0),
-                num_points=data.get('num_points', 0)
+                iteration=iteration,
+                total=total,
+                loss=loss,
+                num_points=num_points
+            )
+            
+            # 更新右侧面板
+            self.right_panel.update_training_info(
+                status=msg,
+                iteration=iteration,
+                total=total,
+                loss=loss,
+                num_points=num_points
             )
     
     def _on_training_visualization_update(self, ply_path: str, iteration: int):
@@ -2147,19 +2191,24 @@ class MainWindow(QMainWindow):
     def _load_training_ply(self, ply_path: str, iteration: int):
         """加载训练中的PLY文件到渲染器"""
         try:
+            print(f"[可视化] 尝试加载训练PLY: 迭代 {iteration}, 文件: {ply_path}")
+            
             if not os.path.exists(ply_path):
+                print(f"[可视化] 文件不存在: {ply_path}")
                 return
             
             # 避免重复加载
             if self._last_loaded_ply == ply_path:
+                print(f"[可视化] 文件已加载，跳过")
                 return
             
             self._last_loaded_ply = ply_path
             
             # 加载新的点云
-            print(f"加载训练可视化: 迭代 {iteration}, 文件: {ply_path}")
+            print(f"[可视化] 开始加载点云...")
             self.pc = GaussianPointCloud(ply_path, sh_degree=3, max_gaussians=None)
             self.renderer.pc = self.pc
+            print(f"[可视化] 点云加载成功，点数: {self.pc.get_xyz.shape[0]:,}")
             
             # 更新窗口标题显示当前迭代
             base_title = self.windowTitle().split(' [')[0]  # 移除旧的迭代标记
@@ -2167,13 +2216,14 @@ class MainWindow(QMainWindow):
             
             # 请求渲染
             self._request_render()
+            print(f"[可视化] 渲染请求已发送")
             
             # 显示提示
             if iteration % 500 == 0:  # 每500次迭代显示一次提示
-                self.toast.show_message(f"训练进度: {iteration} 次迭代，点数: {self.pc.xyz.shape[0]:,}", 2000)
+                self.toast.show_message(f"训练进度: {iteration} 次迭代，点数: {self.pc.get_xyz.shape[0]:,}", 2000)
             
         except Exception as e:
-            print(f"加载训练PLY失败: {e}")
+            print(f"[可视化] 加载训练PLY失败: {e}")
             import traceback
             traceback.print_exc()
     
@@ -2190,6 +2240,8 @@ class MainWindow(QMainWindow):
         """训练完成回调"""
         self._training_update_timer.stop()
         self.left_panel.set_training_active(False)
+        # 隐藏训练信息
+        self.right_panel.update_training_info(status=None)
         # 使用QTimer在主线程中显示消息
         QTimer.singleShot(0, lambda: self.toast.show_message("训练完成！", 3000))
         QTimer.singleShot(0, lambda: self._set_last_event("训练完成"))
@@ -2198,6 +2250,8 @@ class MainWindow(QMainWindow):
         """训练错误回调"""
         self._training_update_timer.stop()
         self.left_panel.set_training_active(False)
+        # 隐藏训练信息
+        self.right_panel.update_training_info(status=None)
         # 使用QTimer在主线程中显示错误
         QTimer.singleShot(0, lambda: QMessageBox.critical(
             self, "训练错误", f"训练过程中发生错误:\n{error_msg}"
@@ -2436,6 +2490,71 @@ def _build_objects(args):
 
     input_path = getattr(args, 'input', None) or getattr(args, 'ply_path', None)
 
+    # 允许空白启动（无输入文件）
+    if not input_path and not getattr(args, 'model_path', None):
+        print("提示: 未指定输入文件，启动空白窗口")
+        print("      可以通过菜单 文件 -> 加载序列/PLY 来加载数据")
+        
+        # 创建默认/空白状态
+        render_w, render_h = 1080, 720
+        if getattr(args, 'render_resolution', None):
+            try:
+                render_w, render_h = _core.parse_resolution(args.render_resolution)
+            except ValueError as e:
+                print(f"分辨率参数错误: {e}"); sys.exit(1)
+        
+        # 创建最小的空点云PLY文件
+        import tempfile
+        from plyfile import PlyData, PlyElement
+        import numpy as np
+        
+        temp_dir = tempfile.gettempdir()
+        temp_ply = os.path.join(temp_dir, "4dgs_empty.ply")
+        
+        # 创建单个点，使用简单的方式避免内存对齐问题
+        vertices = np.zeros(1, dtype=[
+            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+            ('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4'),
+            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
+        ])
+        vertices['x'][0] = 0.0
+        vertices['y'][0] = 0.0
+        vertices['z'][0] = 0.0
+        vertices['nx'][0] = 0.0
+        vertices['ny'][0] = 0.0
+        vertices['nz'][0] = 1.0
+        vertices['red'][0] = 0
+        vertices['green'][0] = 0
+        vertices['blue'][0] = 0
+        
+        # 复制一份确保内存连续
+        vertices = np.ascontiguousarray(vertices)
+        
+        vertex_element = PlyElement.describe(vertices, 'vertex')
+        PlyData([vertex_element]).write(temp_ply)
+        
+        ply_path = temp_ply
+        config = {'sh_degree': 0, 'white_background': False}
+        sh_degree = 0
+        seq_mgr = None
+        
+        # 创建空点云
+        pc = GaussianPointCloud(ply_path, sh_degree=sh_degree, max_gaussians=None)
+        
+        # 创建默认相机
+        bg_color = [0, 0, 0]
+        camera = InteractiveCamera(
+            render_w, render_h,
+            cameras_info=[],
+            scene_center=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            scene_extent=1.0,
+        )
+        
+        renderer = GaussianRenderer(pc, bg_color=bg_color)
+        renderer.set_render_mode(getattr(args, 'display_mode', GaussianRenderer.RENDER_MODE_SPLAT))
+        
+        return renderer, camera, seq_mgr, render_w, render_h
+
     if input_path:
         if os.path.isdir(input_path):
             ply_files = sorted(f for f in os.listdir(input_path) if f.endswith('.ply'))
@@ -2617,10 +2736,11 @@ def main():
 
     args = parser.parse_args()
 
-    if args.input is None and args.model_path is None:
-        parser.print_help()
-        print("\n错误: 请指定序列目录或 PLY 文件")
-        sys.exit(1)
+    # 不再强制要求输入文件，允许空白启动
+    # if args.input is None and args.model_path is None:
+    #     parser.print_help()
+    #     print("\n错误: 请指定序列目录或 PLY 文件")
+    #     sys.exit(1)
 
     app = QApplication(sys.argv)
     app.setApplicationName("4DGS Viewer")

@@ -57,6 +57,7 @@ class RightInfoPanel(QWidget):
         outer.addWidget(scroll, stretch=1)
 
         self._build_scene_card()
+        self._build_training_card()
         self._build_performance_card()
         self._build_cache_card()
         self._build_activity_card()
@@ -77,6 +78,18 @@ class RightInfoPanel(QWidget):
         self._v_hidden_gauss = self.scene_card.add_row("隐藏高斯")
         self._v_deleted_gauss = self.scene_card.add_row("删除高斯")
         self._layout.addWidget(self.scene_card)
+
+    # ── Training Info ─────────────────────────────────────────────────────
+
+    def _build_training_card(self):
+        self.training_card = InfoCard("TRAINING INFO")
+        self._v_training_status = self.training_card.add_row("状态")
+        self._v_training_iteration = self.training_card.add_row("迭代")
+        self._v_training_loss = self.training_card.add_row("Loss")
+        self._v_training_points = self.training_card.add_row("点数")
+        self._layout.addWidget(self.training_card)
+        # 不要在这里隐藏，让CSS控制默认状态
+        self._training_visible = False
 
     # ── Performance ───────────────────────────────────────────────────────
 
@@ -163,3 +176,39 @@ class RightInfoPanel(QWidget):
 
     def set_last_event(self, text: str):
         self._v_last_event.setText(text)
+    
+    def update_training_info(self, status: str = None, iteration: int = 0, 
+                            total: int = 0, loss: float = 0.0, num_points: int = 0):
+        """更新训练信息卡片"""
+        if status:
+            # 训练开始时显示
+            if not self._training_visible:
+                self._training_visible = True
+                print("[DEBUG] 首次显示训练信息卡片")
+            
+            self._v_training_status.setText(status)
+            
+            if total > 0:
+                progress_text = f"{iteration:,} / {total:,} ({iteration*100//total}%)"
+                self._v_training_iteration.setText(progress_text)
+            else:
+                self._v_training_iteration.setText(f"{iteration:,}")
+            
+            if loss > 0:
+                self._v_training_loss.setText(f"{loss:.6f}")
+            else:
+                self._v_training_loss.setText("—")
+            
+            if num_points > 0:
+                self._v_training_points.setText(f"{num_points:,}")
+            else:
+                self._v_training_points.setText("—")
+        else:
+            # 训练结束，重置状态
+            if self._training_visible:
+                self._training_visible = False
+                self._v_training_status.setText("—")
+                self._v_training_iteration.setText("—")
+                self._v_training_loss.setText("—")
+                self._v_training_points.setText("—")
+                print("[DEBUG] 清空训练信息")
