@@ -949,6 +949,15 @@ class MainWindow(QMainWindow):
         
         # Hide left panel initially
         self._set_left_panel_visible(False)
+        
+        # Update file info in left panel
+        seq_path = None
+        cam_path = None
+        if self.seq:
+            seq_path = getattr(self.seq, 'data_dir', None) or 'Sequence Loaded'
+        if hasattr(self.camera, 'cameras_info') and len(self.camera.cameras_info) > 0:
+            cam_path = 'Camera Loaded'
+        self.left_panel.update_file_info(seq_path, cam_path)
 
         # ── Timers ──
         self._render_timer = QTimer(self)
@@ -1171,6 +1180,8 @@ class MainWindow(QMainWindow):
         self.left_panel.delete_selected_clicked.connect(self._delete_selected)
         self.left_panel.delete_unselected_clicked.connect(self._delete_unselected)
         self.left_panel.restore_deleted_clicked.connect(self._restore_deleted)
+        self.left_panel.load_sequence_clicked.connect(self._load_sequence)
+        self.left_panel.load_camera_clicked.connect(self._load_camera_params)
 
         # ── Bottom Bar ──
         if self.seq:
@@ -1928,6 +1939,142 @@ class MainWindow(QMainWindow):
         self._set_last_event(f"截图: {fname}")
         self.toast.show_message(f"截图已保存: {fname} ({w}×{h})", 3000)
         print(f"截图已保存: {fname}  ({w}×{h})")
+    
+    def _load_sequence(self):
+        """加载点云序列文件"""
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        
+        # 选择文件夹或文件
+        file_path = QFileDialog.getExistingDirectory(
+            self,
+            "选择点云序列文件夹",
+            "",
+            QFileDialog.ShowDirsOnly
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            self.toast.show_message("正在加载点云序列...", 2000)
+            QApplication.processEvents()
+            
+            # 检查是否是序列文件夹
+            ply_files = []
+            if os.path.isdir(file_path):
+                ply_files = sorted([f for f in os.listdir(file_path) if f.endswith('.ply')])
+            
+            if not ply_files:
+                # 尝试作为单个PLY文件
+                file_path = QFileDialog.getOpenFileName(
+                    self,
+                    "选择PLY文件",
+                    "",
+                    "PLY Files (*.ply)"
+                )[0]
+                if not file_path:
+                    return
+            
+            # 重新加载序列
+            if os.path.isdir(file_path) and ply_files:
+                # 多帧序列
+                self.seq = SequenceManager(file_path, load_mode='cpu_cache')
+                self.seq.set_frame(0)
+                frame = self.seq.get_current_frame_data(prefer_device=self._preferred_frame_device)
+                self.pc = GaussianPointCloud.from_frame(frame)
+                self.renderer.pc = self.pc
+                self.ui_state.project_mode = "4DGS"
+                self.ui_state.total_frames = self.seq.num_frames
+                
+                # 更新底部时间线（如果需要）
+                # Note: BottomTimelineBar在初始化时设置，动态更新需要重建或使用特定方法
+                
+                self.toast.show_message(f"已加载序列: {len(ply_files)} 帧", 3000)
+            else:
+                # 单帧
+                self.pc = GaussianPointCloud(file_path, sh_degree=3, max_gaussians=None)
+                self.renderer.pc = self.pc
+                self.seq = None
+                self.ui_state.project_mode = "3DGS"
+                self.ui_state.total_frames = 1
+                
+                self.toast.show_message(f"已加载单帧PLY", 2000)
+            
+            # 更新UI
+            self.left_panel.update_file_info(seq_path=file_path)
+            self.ui_state.scene_name = os.path.basename(file_path)
+            self.setWindowTitle(f"4DGS Viewer · {self.ui_state.scene_name}")
+            
+            # 重置相机和渲染
+            self.camera.reset()
+            self._request_render()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"无法加载点云序列:\n{str(e)}")
+            print(f"加载序列失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _load_camera_params(self):
+        """加载相机参数"""
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        
+        # 选择COLMAP sparse/0文件夹
+        dir_path = QFileDialog.getExistingDirectory(
+            self,
+            "选择COLMAP sparse/0文件夹",
+            "",
+            QFileDialog.ShowDirsOnly
+        )
+        
+        if not dir_path:
+            return
+        
+        try:
+            self.toast.show_message("正在加载相机参数...", 2000)
+            QApplication.processEvents()
+            
+            # 检查必要文件
+            cameras_file = os.path.join(dir_path, "cameras.txt")
+            images_file = os.path.join(dir_path, "images.txt")
+            
+            if not os.path.exists(cameras_file) or not os.path.exists(images_file):
+                QMessageBox.warning(
+                    self, 
+                    "文件缺失", 
+                    f"未找到cameras.txt或images.txt\n请选择COLMAP sparse文件夹"
+                )
+                return
+            
+            # 加载相机参数
+            cameras_info = _core.load_cameras_from_colmap(dir_path)
+            
+            if not cameras_info:
+                QMessageBox.warning(self, "加载失败", "未能加载相机参数")
+                return
+            
+            # 更新相机
+            self.camera.cameras_info = cameras_info
+            self.camera.current_camera_idx = -1
+            
+            # 更新左侧面板的相机位姿选择器
+            if hasattr(self.left_panel, 'camera_pose_combo') and self.left_panel.camera_pose_combo:
+                self.left_panel.camera_pose_combo.clear()
+                self.left_panel.camera_pose_combo.addItem("自由视角")
+                for i, cam in enumerate(cameras_info):
+                    self.left_panel.camera_pose_combo.addItem(f"{i+1}. {cam['name']}")
+            
+            # 更新UI
+            self.left_panel.update_file_info(cam_path=dir_path)
+            self.toast.show_message(f"已加载 {len(cameras_info)} 个相机位姿", 3000)
+            
+            self._request_render()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"无法加载相机参数:\n{str(e)}")
+            print(f"加载相机参数失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _export_current_frame_ply(self):
         scene_base = self._scene_name().replace(os.sep, "_")

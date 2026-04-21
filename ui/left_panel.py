@@ -42,6 +42,8 @@ class LeftControlPanel(QWidget):
     delete_selected_clicked = pyqtSignal()
     delete_unselected_clicked = pyqtSignal()
     restore_deleted_clicked = pyqtSignal()
+    load_sequence_clicked   = pyqtSignal()
+    load_camera_clicked     = pyqtSignal()
 
     def __init__(self, state: UIState, cameras_info=None, parent=None):
         super().__init__(parent)
@@ -84,12 +86,73 @@ class LeftControlPanel(QWidget):
         scroll.setWidget(scroll_content)
         outer.addWidget(scroll, stretch=1)
 
+        self._build_file_section()
         self._build_display_section()
         self._build_gaussian_section()
         self._build_selection_section()
         self._build_camera_section()
         self._layout.addStretch()
 
+    # ── File Loading Section ──────────────────────────────────────────────
+
+    def _build_file_section(self):
+        sec = CollapsibleSection("文件加载", expanded=False)
+        cl = sec.content_layout
+
+        # Load sequence button
+        load_seq_btn = QPushButton("加载点云序列")
+        load_seq_btn.setToolTip("选择PLY序列文件夹或单个PLY文件")
+        load_seq_btn.clicked.connect(self.load_sequence_clicked.emit)
+        cl.addWidget(load_seq_btn)
+
+        # Load camera button
+        load_cam_btn = QPushButton("加载相机参数")
+        load_cam_btn.setToolTip("选择COLMAP sparse/0文件夹")
+        load_cam_btn.clicked.connect(self.load_camera_clicked.emit)
+        cl.addWidget(load_cam_btn)
+        
+        # Current files info
+        self.current_seq_label = QLabel("序列: 未加载")
+        self.current_seq_label.setWordWrap(True)
+        self.current_seq_label.setObjectName("SectionLabel")
+        cl.addWidget(self.current_seq_label)
+        
+        self.current_cam_label = QLabel("相机: 未加载")
+        self.current_cam_label.setWordWrap(True)
+        self.current_cam_label.setObjectName("SectionLabel")
+        cl.addWidget(self.current_cam_label)
+
+        self._layout.addWidget(sec)
+    # ── File Loading Section ──────────────────────────────────────────────
+
+    def _build_file_section(self):
+        sec = CollapsibleSection("文件加载", expanded=False)
+        cl = sec.content_layout
+
+        # Load sequence button
+        load_seq_btn = QPushButton("加载点云序列")
+        load_seq_btn.setToolTip("选择PLY序列文件夹或单个PLY文件")
+        load_seq_btn.clicked.connect(self.load_sequence_clicked.emit)
+        cl.addWidget(load_seq_btn)
+
+        # Load camera button
+        load_cam_btn = QPushButton("加载相机参数")
+        load_cam_btn.setToolTip("选择COLMAP sparse/0文件夹")
+        load_cam_btn.clicked.connect(self.load_camera_clicked.emit)
+        cl.addWidget(load_cam_btn)
+        
+        # Current files info
+        self.current_seq_label = QLabel("序列: 未加载")
+        self.current_seq_label.setWordWrap(True)
+        self.current_seq_label.setObjectName("SectionLabel")
+        cl.addWidget(self.current_seq_label)
+        
+        self.current_cam_label = QLabel("相机: 未加载")
+        self.current_cam_label.setWordWrap(True)
+        self.current_cam_label.setObjectName("SectionLabel")
+        cl.addWidget(self.current_cam_label)
+
+        self._layout.addWidget(sec)
     # ── Display Section ───────────────────────────────────────────────────
 
     def _build_display_section(self):
@@ -307,6 +370,17 @@ class LeftControlPanel(QWidget):
         cl.addWidget(btn_reset)
 
         self._layout.addWidget(sec)
+    
+    def update_file_info(self, seq_path=None, cam_path=None):
+        """更新文件加载信息显示"""
+        if seq_path is not None:
+            import os
+            seq_name = os.path.basename(seq_path) if seq_path else "未加载"
+            self.current_seq_label.setText(f"序列: {seq_name}")
+        if cam_path is not None:
+            import os
+            cam_name = os.path.basename(os.path.dirname(cam_path)) if cam_path else "未加载"
+            self.current_cam_label.setText(f"相机: {cam_name}")
 
     # ── Sync helpers ──────────────────────────────────────────────────────
 
@@ -332,6 +406,17 @@ class LeftControlPanel(QWidget):
             self.camera_pose_combo.blockSignals(True)
             self.camera_pose_combo.setCurrentIndex(idx + 1)
             self.camera_pose_combo.blockSignals(False)
+    
+    def update_file_info(self, seq_path=None, cam_path=None):
+        """更新文件加载信息显示"""
+        if seq_path is not None:
+            import os
+            seq_name = os.path.basename(seq_path) if seq_path else "未加载"
+            self.current_seq_label.setText(f"序列: {seq_name}")
+        if cam_path is not None:
+            import os
+            cam_name = os.path.basename(os.path.dirname(cam_path)) if cam_path else "未加载"
+            self.current_cam_label.setText(f"相机: {cam_name}")
 
     def sync_point_size(self, val: float):
         self.point_size_spin.blockSignals(True)
