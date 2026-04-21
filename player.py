@@ -919,7 +919,6 @@ class MainWindow(QMainWindow):
             spec.loader.exec_module(viz_module)
             GaussianRenderer = viz_module.GaussianRenderer
             
-            import torch
             class DummyPC:
                 def __init__(self):
                     self.get_xyz = torch.zeros((0, 3), dtype=torch.float32)
@@ -929,6 +928,9 @@ class MainWindow(QMainWindow):
                     self.get_opacity = torch.zeros((0, 1), dtype=torch.float32)
                     self.scene_center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
                     self.scene_extent = 1.0
+                    self.active_sh_degree = 0  # 空场景SH度数为0
+                    self.current_point_count = 0
+                    self.sampled_point_count = 0
             
             dummy_pc = DummyPC()
             renderer = GaussianRenderer(dummy_pc, bg_color=[0, 0, 0])
@@ -1016,8 +1018,8 @@ class MainWindow(QMainWindow):
         # Sync initial state
         self._sync_initial_state()
         
-        # Hide left panel initially
-        self._set_left_panel_visible(False)
+        # 左侧面板默认展开（工具分类默认折叠）
+        # self._set_left_panel_visible(False)
         
         # Update file info in left panel
         seq_path = None
@@ -1049,9 +1051,11 @@ class MainWindow(QMainWindow):
         fm.addAction(a)
         a = QAction("导出当前编辑帧 PLY", self); a.triggered.connect(self._export_current_frame_ply)
         fm.addAction(a)
-        if self.seq:
-            a = QAction("导出序列 PLY", self); a.triggered.connect(self._export_sequence_ply)
-            fm.addAction(a)
+        # 始终添加导出序列菜单项（运行时检查是否有序列）
+        self.export_sequence_action = QAction("导出序列 PLY", self)
+        self.export_sequence_action.triggered.connect(self._export_sequence_ply)
+        self.export_sequence_action.setEnabled(self.seq is not None)  # 根据序列状态启用/禁用
+        fm.addAction(self.export_sequence_action)
         fm.addSeparator()
         a = QAction("退出 (&Q)", self); a.setShortcut("Ctrl+Q"); a.triggered.connect(self.close)
         fm.addAction(a)
@@ -1158,6 +1162,7 @@ class MainWindow(QMainWindow):
         main_vl.addWidget(middle, stretch=1)
 
         # ── Bottom timeline ──
+        self.main_vl = main_vl  # 保存引用，用于重建底部工具栏
         self.bottom_bar = BottomTimelineBar(
             self.ui_state,
             has_sequence=self.seq is not None,
@@ -1262,19 +1267,62 @@ class MainWindow(QMainWindow):
         self.left_panel.stop_training_clicked.connect(self._stop_training)
 
         # ── Bottom Bar ──
-        if self.seq:
-            self.bottom_bar.play_toggled.connect(self._on_play_toggled)
-            self.bottom_bar.first_frame.connect(lambda: self._jump_to_frame(0))
-            self.bottom_bar.prev_frame.connect(lambda: (self.seq.prev_frame(), self._reload()))
-            self.bottom_bar.next_frame.connect(lambda: (self.seq.next_frame(), self._reload()))
-            self.bottom_bar.last_frame.connect(lambda: self._jump_to_frame(self.seq.num_frames - 1))
-            self.bottom_bar.seek_moved.connect(self._on_seek_moved)
-            self.bottom_bar.seek_released.connect(self._on_seek_released)
-            self.bottom_bar.fps_changed.connect(lambda v: (self.seq.set_fps(v), self._request_render()))
-            self.bottom_bar.loop_toggled.connect(self._on_loop_toggled)
+        self._connect_bottom_bar()
 
         # ── Viewport Overlay ──
         self.overlay.quick_vis_mode_clicked.connect(self._set_vis_mode)
+
+    def _connect_bottom_bar(self):
+        """连接或重新连接底部工具栏的信号（用于动态加载序列后）"""
+        if not self.seq:
+            return
+        
+        # 先断开所有连接（避免重复连接）
+        try:
+            self.bottom_bar.play_toggled.disconnect()
+            self.bottom_bar.first_frame.disconnect()
+            self.bottom_bar.prev_frame.disconnect()
+            self.bottom_bar.next_frame.disconnect()
+            self.bottom_bar.last_frame.disconnect()
+            self.bottom_bar.seek_moved.disconnect()
+            self.bottom_bar.seek_released.disconnect()
+            self.bottom_bar.fps_changed.disconnect()
+            self.bottom_bar.loop_toggled.disconnect()
+        except:
+            pass  # 如果之前没有连接，忽略错误
+        
+        # 重新连接
+        self.bottom_bar.play_toggled.connect(self._on_play_toggled)
+        self.bottom_bar.first_frame.connect(lambda: self._jump_to_frame(0))
+        self.bottom_bar.prev_frame.connect(lambda: (self.seq.prev_frame(), self._reload()))
+        self.bottom_bar.next_frame.connect(lambda: (self.seq.next_frame(), self._reload()))
+        self.bottom_bar.last_frame.connect(lambda: self._jump_to_frame(self.seq.num_frames - 1))
+        self.bottom_bar.seek_moved.connect(self._on_seek_moved)
+        self.bottom_bar.seek_released.connect(self._on_seek_released)
+        self.bottom_bar.fps_changed.connect(lambda v: (self.seq.set_fps(v), self._request_render()))
+        self.bottom_bar.loop_toggled.connect(self._on_loop_toggled)
+    
+    def _rebuild_bottom_bar(self):
+        """重建底部工具栏（当从无序列加载序列后）"""
+        if not self.seq:
+            return
+        
+        # 移除旧的工具栏
+        if self.bottom_bar:
+            self.main_vl.removeWidget(self.bottom_bar)
+            self.bottom_bar.deleteLater()
+        
+        # 创建新的工具栏（带有播放控制）
+        self.bottom_bar = BottomTimelineBar(
+            self.ui_state,
+            has_sequence=True,  # 现在有序列了
+            num_frames=self.seq.num_frames,
+            playback_fps=self.seq.fps,
+        )
+        self.main_vl.addWidget(self.bottom_bar)
+        
+        # 连接信号
+        self._connect_bottom_bar()
 
     # ═══════════════════════════════════════════════════════════════════════
     # Shortcuts
@@ -1287,16 +1335,10 @@ class MainWindow(QMainWindow):
         self._shortcuts.append(sc)
 
     def _install_shortcuts(self):
-        if self.seq:
-            self._register_shortcut(Qt.Key_Space, self._toggle_play)
-            self._register_shortcut(Qt.Key_Left, lambda: (self.seq.prev_frame(), self._reload()))
-            self._register_shortcut(Qt.Key_Right, lambda: (self.seq.next_frame(), self._reload()))
-            self._register_shortcut(Qt.Key_Home, lambda: self._jump_to_frame(0))
-            self._register_shortcut(Qt.Key_End, lambda: self._jump_to_frame(self.seq.num_frames - 1))
-            self._register_shortcut(Qt.Key_Minus, lambda: self._adj_fps(-5.0))
-            self._register_shortcut(Qt.Key_Equal, lambda: self._adj_fps(+5.0))
-            self._register_shortcut(Qt.Key_Plus, lambda: self._adj_fps(+5.0))
-
+        # 序列相关快捷键（分离出来，以便动态添加）
+        self._install_sequence_shortcuts()
+        
+        # 通用快捷键（始终可用）
         self._register_shortcut(Qt.Key_Escape, self.close)
         self._register_shortcut(Qt.Key_F11, self._toggle_fullscreen)
         self._register_shortcut(Qt.Key_F, self._toggle_fullscreen)
@@ -1325,6 +1367,38 @@ class MainWindow(QMainWindow):
         self._register_shortcut(Qt.Key_Tab, self._toggle_panels)
         self._register_shortcut(Qt.Key_H, self._toggle_hud)
         self._register_shortcut("Ctrl+Return", self._toggle_presentation)
+    
+    def _install_sequence_shortcuts(self):
+        """注册或重新注册序列相关的快捷键（用于动态加载序列后）"""
+        if not self.seq:
+            return
+        
+        # 先移除旧的序列快捷键（如果有）
+        if hasattr(self, '_sequence_shortcuts'):
+            for sc in self._sequence_shortcuts:
+                try:
+                    sc.setEnabled(False)
+                    sc.deleteLater()
+                except:
+                    pass
+        
+        self._sequence_shortcuts = []
+        
+        # 注册序列快捷键
+        def register_seq_shortcut(key, callback):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.WindowShortcut)
+            sc.activated.connect(callback)
+            self._sequence_shortcuts.append(sc)
+        
+        register_seq_shortcut(Qt.Key_Space, self._toggle_play)
+        register_seq_shortcut(Qt.Key_Left, lambda: (self.seq.prev_frame(), self._reload()))
+        register_seq_shortcut(Qt.Key_Right, lambda: (self.seq.next_frame(), self._reload()))
+        register_seq_shortcut(Qt.Key_Home, lambda: self._jump_to_frame(0))
+        register_seq_shortcut(Qt.Key_End, lambda: self._jump_to_frame(self.seq.num_frames - 1))
+        register_seq_shortcut(Qt.Key_Minus, lambda: self._adj_fps(-5.0))
+        register_seq_shortcut(Qt.Key_Equal, lambda: self._adj_fps(+5.0))
+        register_seq_shortcut(Qt.Key_Plus, lambda: self._adj_fps(+5.0))
 
     # ═══════════════════════════════════════════════════════════════════════
     # Render Loop (核心逻辑不变)
@@ -2073,7 +2147,12 @@ class MainWindow(QMainWindow):
             # 重新加载序列
             if os.path.isdir(file_path) and ply_files:
                 # 多帧序列
-                self.seq = SequenceManager(file_path, load_mode='cpu_cache')
+                self.seq = SequenceManager(
+                    file_path, 
+                    load_mode='preload_cpu',  # 使用 preload_cpu 模式
+                    gpu_cache_size=10,        # GPU 缓存 10 帧
+                    cpu_cache_size=30,        # CPU 缓存 30 帧
+                )
                 self.seq.set_frame(0)
                 frame = self.seq.get_current_frame_data(prefer_device=self._preferred_frame_device)
                 self.pc = GaussianPointCloud.from_frame(frame)
@@ -2081,8 +2160,32 @@ class MainWindow(QMainWindow):
                 self.ui_state.project_mode = "4DGS"
                 self.ui_state.total_frames = self.seq.num_frames
                 
-                # 更新底部时间线（如果需要）
-                # Note: BottomTimelineBar在初始化时设置，动态更新需要重建或使用特定方法
+                # 更新相机的场景范围（用于调整移动速度）
+                if self.pc:
+                    self.camera.scene_center = self.pc.scene_center
+                    self.camera.scene_extent = self.pc.scene_extent
+                    self.camera.move_speed = self.camera.scene_extent * 0.01  # 提高移动速度
+                    self.camera.reset()
+                
+                # 重建底部工具栏（如果之前没有序列）
+                # 检查是否需要重建：如果工具栏没有 has_sequence 标志，就需要重建
+                if not hasattr(self.bottom_bar, 'has_sequence') or not self.bottom_bar.has_sequence:
+                    print("[加载序列] 检测到之前没有序列，重建底部工具栏...")
+                    self._rebuild_bottom_bar()
+                else:
+                    # 如果已经有序列，只需要更新和重新连接
+                    self.bottom_bar.update_total_frames(self.seq.num_frames)
+                    self.bottom_bar.sync_frame_index(0)
+                    self.bottom_bar.sync_playing(False)
+                    self._connect_bottom_bar()
+                
+                # 启用导出序列菜单项
+                if hasattr(self, 'export_sequence_action'):
+                    self.export_sequence_action.setEnabled(True)
+                
+                # 重新注册序列快捷键
+                self._install_sequence_shortcuts()
+                print("[加载序列] 序列快捷键已注册：空格/←/→/Home/End/-/+")
                 
                 self.toast.show_message(f"已加载序列: {len(ply_files)} 帧", 3000)
             else:
@@ -2100,8 +2203,15 @@ class MainWindow(QMainWindow):
             self.ui_state.scene_name = os.path.basename(file_path)
             self.setWindowTitle(f"4DGS Viewer · {self.ui_state.scene_name}")
             
-            # 重置相机和渲染
-            self.camera.reset()
+            # 重置相机和渲染（在单帧模式下也重置）
+            if not (os.path.isdir(file_path) and ply_files):
+                # 单帧模式，更新相机场景信息
+                if self.pc:
+                    self.camera.scene_center = self.pc.scene_center
+                    self.camera.scene_extent = self.pc.scene_extent
+                    self.camera.move_speed = self.camera.scene_extent * 0.01
+                    self.camera.reset()
+            
             self._request_render()
             
         except Exception as e:
@@ -2934,7 +3044,7 @@ def _build_objects(args):
             playback_fps  = playback_fps,
             load_mode     = getattr(args, 'load_mode', SequenceManager.LOAD_MODE_AUTO),
             gpu_cache_size= _core.clamp_positive_int(getattr(args, 'gpu_cache_size', 10), 10),
-            cpu_cache_size= _core.clamp_positive_int(getattr(args, 'cpu_cache_size',  3),  3),
+            cpu_cache_size= _core.clamp_positive_int(getattr(args, 'cpu_cache_size', 30), 30),  # 默认 30 帧
             prefetch_count= max(0, int(getattr(args, 'prefetch_count', 2))),
             io_workers    = io_workers,
             pin_memory    = not getattr(args, 'no_pin_memory', False),

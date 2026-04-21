@@ -196,6 +196,33 @@ class BottomTimelineBar(QWidget):
         self.loop_check.blockSignals(True)
         self.loop_check.setChecked(enabled)
         self.loop_check.blockSignals(False)
+    
+    def update_total_frames(self, num_frames: int):
+        """更新总帧数（用于动态加载序列）"""
+        if not self.has_sequence:
+            return
+        self.seek.blockSignals(True)
+        self.seek.setRange(0, max(0, num_frames - 1))
+        self.seek.blockSignals(False)
+        self.lbl_total.setText(str(num_frames))
+    
+    def sync_frame_index(self, frame_idx: int):
+        """同步当前帧索引"""
+        if not self.has_sequence:
+            return
+        self.seek.blockSignals(True)
+        self.seek.setValue(frame_idx)
+        self.seek.blockSignals(False)
+        self.lbl_cur.setText(str(frame_idx + 1))
+    
+    def sync_playing(self, is_playing: bool):
+        """同步播放状态"""
+        if not self.has_sequence:
+            return
+        self.btn_play.blockSignals(True)
+        self.btn_play.setChecked(is_playing)
+        self.btn_play.setText("⏸" if is_playing else "▶")
+        self.btn_play.blockSignals(False)
 
     @staticmethod
     def _transport_btn(text: str, tip: str, checkable=False) -> QPushButton:

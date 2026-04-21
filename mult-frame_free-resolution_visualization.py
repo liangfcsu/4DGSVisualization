@@ -3097,9 +3097,9 @@ class InteractiveCamera:
         print(f"  相机初始位置: {self.position}")
         
         # SIBR风格速度控制
-        self.move_speed = scene_extent * 0.002  # 移动速度 (WASD/QE)
+        self.move_speed = scene_extent * 0.01  # 移动速度 (WASD/QE) - 提高5倍速度
         self.rot_speed = 0.02  # 旋转速度 (IJKL/UO)
-        self.mouse_sensitivity = 0.003  # 鼠标灵敏度
+        self.mouse_sensitivity = 0.005  # 鼠标灵敏度 - 提高灵敏度
         
         # 相机模式
         self.mode = self.MODE_FPS

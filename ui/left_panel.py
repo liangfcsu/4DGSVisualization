@@ -130,7 +130,7 @@ class LeftControlPanel(QWidget):
     # ── Display Section ───────────────────────────────────────────────────
 
     def _build_display_section(self):
-        sec = CollapsibleSection("Display", expanded=True)
+        sec = CollapsibleSection("Display", expanded=False)
         cl = sec.content_layout
 
         # Resolution
@@ -322,7 +322,7 @@ class LeftControlPanel(QWidget):
     # ── Gaussian Section ──────────────────────────────────────────────────
 
     def _build_gaussian_section(self):
-        sec = CollapsibleSection("Gaussian", expanded=True)
+        sec = CollapsibleSection("Gaussian", expanded=False)
         cl = sec.content_layout
 
         # Point size
@@ -368,7 +368,7 @@ class LeftControlPanel(QWidget):
     # ── Selection Section ────────────────────────────────────────────────
 
     def _build_selection_section(self):
-        sec = CollapsibleSection("Selection", expanded=True)
+        sec = CollapsibleSection("Selection", expanded=False)
         cl = sec.content_layout
 
         self.selection_mode_btn = QPushButton("启用选择模式")
