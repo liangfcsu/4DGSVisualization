@@ -60,7 +60,7 @@ from functools import lru_cache
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from plyfile import PlyData
+from plyfile import PlyData, PlyElement
 from numpy.lib import recfunctions as np_recfunctions
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
@@ -2192,7 +2192,11 @@ class SequenceManager:
 
 class GaussianPointCloud:
     """加载和管理3D Gaussian点云数据"""
-    
+
+    STATE_SELECTED = np.uint8(1)
+    STATE_HIDDEN = np.uint8(2)
+    STATE_DELETED = np.uint8(4)
+
     def __init__(self, ply_path, sh_degree=3, device="cuda", max_gaussians=None):
         self.device = device
         self.max_sh_degree = sh_degree
@@ -2201,7 +2205,7 @@ class GaussianPointCloud:
         self.max_gaussians = max_gaussians
         self._reset_storage()
         self.load_ply(ply_path)
-    
+
     @classmethod
     def from_frame(cls, frame, device="cuda"):
         pc = cls.__new__(cls)
@@ -2220,24 +2224,30 @@ class GaussianPointCloud:
         self._scaling_buffer = None
         self._rotation_buffer = None
         self._opacity_buffer = None
+        self._masked_opacity_buffer = None
         self._frame_ref = None
         self._xyz = None
         self._features = None
         self._scaling = None
         self._rotation = None
         self._opacity = None
+        self._source_opacity = None
         self._point_count = 0
         self._buffer_capacity = 0
         self._sample_index_cache = {}
+        self._edit_state = None
+        self._edit_state_key = None
+        self._edit_state_store = {}
+        self._edit_state_version = 0
 
     def _buffer_device(self):
         return torch.device(self.device)
 
     def _copy_into(self, dst, src):
         non_blocking = False
-        if src.device.type == 'cuda':
+        if src.device.type == "cuda":
             non_blocking = True
-        elif src.device.type == 'cpu' and src.is_pinned():
+        elif src.device.type == "cpu" and src.is_pinned():
             non_blocking = True
         dst.copy_(src, non_blocking=non_blocking)
 
@@ -2251,6 +2261,7 @@ class GaussianPointCloud:
         self._scaling_buffer = torch.empty((capacity, scaling_dim), dtype=torch.float32, device=device)
         self._rotation_buffer = torch.empty((capacity, rotation_dim), dtype=torch.float32, device=device)
         self._opacity_buffer = torch.empty((capacity, opacity_dim), dtype=torch.float32, device=device)
+        self._masked_opacity_buffer = torch.empty((capacity, opacity_dim), dtype=torch.float32, device=device)
         self._buffer_capacity = capacity
 
     def _ensure_buffers(self, point_count, features_shape, scaling_shape, rotation_shape, opacity_shape):
@@ -2271,6 +2282,7 @@ class GaussianPointCloud:
             or self._scaling_buffer.shape[1:] != scaling_shape
             or self._rotation_buffer.shape[1:] != rotation_shape
             or self._opacity_buffer.shape[1:] != opacity_shape
+            or self._masked_opacity_buffer.shape[1:] != opacity_shape
             or self._xyz_buffer.device != self._buffer_device()
         ):
             self._allocate_buffers(
@@ -2290,11 +2302,122 @@ class GaussianPointCloud:
 
         index_np = np.linspace(0, total_points - 1, num=max_points, dtype=np.int64)
         indices = torch.from_numpy(index_np)
-        if device.type != 'cpu':
+        if device.type != "cpu":
             indices = indices.to(device=device, non_blocking=True)
         self._sample_index_cache[key] = indices
         return indices
-    
+
+    def _derive_edit_state_key(self, source_path):
+        source_path = os.path.abspath(source_path) if source_path else ""
+        base_name = os.path.basename(source_path)
+        window_match = re.search(r"(window_\d+)", base_name)
+        if window_match:
+            bucket = window_match.group(1)
+        else:
+            bucket = "__global__"
+        return f"{os.path.dirname(source_path)}::{bucket}"
+
+    def _ensure_edit_state(self, point_count, source_path=None):
+        point_count = int(point_count)
+        state_key = self._derive_edit_state_key(source_path or self.ply_path)
+        prev_key = self._edit_state_key
+
+        state = self._edit_state_store.get(state_key)
+        if state is None or state.shape[0] != point_count:
+            state = np.zeros((max(0, point_count),), dtype=np.uint8)
+            self._edit_state_store[state_key] = state
+            self._edit_state_version += 1
+
+        self._edit_state_key = state_key
+        self._edit_state = state
+        if prev_key != state_key:
+            self._edit_state_version += 1
+
+    def _visible_mask(self):
+        if self._edit_state is None:
+            return np.zeros((0,), dtype=bool)
+        return (self._edit_state & (self.STATE_HIDDEN | self.STATE_DELETED)) == 0
+
+    def _ensure_masked_opacity_buffer(self):
+        if self._source_opacity is None or self._point_count <= 0:
+            return
+        required_shape = (self._point_count, *self._source_opacity.shape[1:])
+        if (
+            self._masked_opacity_buffer is None
+            or self._masked_opacity_buffer.shape[0] < required_shape[0]
+            or self._masked_opacity_buffer.shape[1:] != required_shape[1:]
+            or self._masked_opacity_buffer.device != self._source_opacity.device
+        ):
+            self._masked_opacity_buffer = torch.empty(
+                required_shape,
+                dtype=torch.float32,
+                device=self._source_opacity.device,
+            )
+
+    def _selected_mask(self):
+        if self._edit_state is None:
+            return np.zeros((0,), dtype=bool)
+        return (self._edit_state & self.STATE_SELECTED) != 0
+
+    def _refresh_edit_filters(self):
+        if self._source_opacity is None or self._point_count <= 0:
+            self._opacity = self._source_opacity
+            return
+
+        if self._edit_state is None or self._edit_state.shape[0] != self._point_count:
+            self._opacity = self._source_opacity
+            return
+
+        visible = self._visible_mask()
+        if visible.size == 0 or visible.all():
+            self._opacity = self._source_opacity
+            return
+
+        self._ensure_masked_opacity_buffer()
+        self._copy_into(self._masked_opacity_buffer[:self._point_count], self._source_opacity)
+        visible_mask = torch.from_numpy(visible.astype(np.float32))
+        if self._source_opacity.device.type != "cpu":
+            visible_mask = visible_mask.to(device=self._source_opacity.device, non_blocking=True)
+        self._masked_opacity_buffer[:self._point_count].mul_(visible_mask[:, None])
+        self._opacity = self._masked_opacity_buffer[:self._point_count]
+
+    def _assign_active_frame(self, frame, point_count, active_sh_degree, src_xyz, src_features, src_scaling, src_rotation, src_opacity):
+        self._point_count = point_count
+        self._xyz = src_xyz
+        self._features = src_features
+        self._scaling = src_scaling
+        self._rotation = src_rotation
+        self._source_opacity = src_opacity
+        self._opacity = src_opacity
+        self.scene_center = frame.scene_center.copy()
+        self.scene_extent = frame.scene_extent
+        self.active_sh_degree = active_sh_degree
+        self.max_sh_degree = frame.sh_degree
+        self._ensure_edit_state(point_count, source_path=frame.source_path)
+        self._refresh_edit_filters()
+
+    def _sanitize_indices(self, indices):
+        if self._edit_state is None or self._point_count <= 0:
+            return np.empty((0,), dtype=np.int64)
+        if isinstance(indices, torch.Tensor):
+            arr = indices.detach().cpu().numpy()
+        else:
+            arr = np.asarray(indices)
+        if arr.size == 0:
+            return np.empty((0,), dtype=np.int64)
+        arr = np.asarray(arr, dtype=np.int64).reshape(-1)
+        arr = arr[(arr >= 0) & (arr < self._point_count)]
+        if arr.size == 0:
+            return arr
+        arr = np.unique(arr)
+        editable = (self._edit_state[arr] & (self.STATE_HIDDEN | self.STATE_DELETED)) == 0
+        return arr[editable]
+
+    def _mark_state_changed(self, refresh_visibility=False):
+        self._edit_state_version += 1
+        if refresh_visibility:
+            self._refresh_edit_filters()
+
     def apply_frame(self, frame, max_points=None, sh_degree=None):
         src_xyz = frame.xyz
         src_features = frame.features
@@ -2326,16 +2449,16 @@ class GaussianPointCloud:
             and src_xyz.device == self._buffer_device()
         ):
             self._frame_ref = frame
-            self._point_count = point_count
-            self._xyz = src_xyz
-            self._features = src_features
-            self._scaling = src_scaling
-            self._rotation = src_rotation
-            self._opacity = src_opacity
-            self.scene_center = frame.scene_center.copy()
-            self.scene_extent = frame.scene_extent
-            self.active_sh_degree = active_sh_degree
-            self.max_sh_degree = frame.sh_degree
+            self._assign_active_frame(
+                frame,
+                point_count,
+                active_sh_degree,
+                src_xyz,
+                src_features,
+                src_scaling,
+                src_rotation,
+                src_opacity,
+            )
             return
 
         self._frame_ref = None
@@ -2353,22 +2476,22 @@ class GaussianPointCloud:
         self._copy_into(self._rotation_buffer[:point_count], src_rotation)
         self._copy_into(self._opacity_buffer[:point_count], src_opacity)
 
-        self._point_count = point_count
-        self._xyz = self._xyz_buffer[:point_count]
-        self._features = self._features_buffer[:point_count]
-        self._scaling = self._scaling_buffer[:point_count]
-        self._rotation = self._rotation_buffer[:point_count]
-        self._opacity = self._opacity_buffer[:point_count]
-        self.scene_center = frame.scene_center.copy()
-        self.scene_extent = frame.scene_extent
-        self.active_sh_degree = active_sh_degree
-        self.max_sh_degree = frame.sh_degree
-    
+        self._assign_active_frame(
+            frame,
+            point_count,
+            active_sh_degree,
+            self._xyz_buffer[:point_count],
+            self._features_buffer[:point_count],
+            self._scaling_buffer[:point_count],
+            self._rotation_buffer[:point_count],
+            self._opacity_buffer[:point_count],
+        )
+
     def reload(self, ply_path):
         """重新加载点云（用于序列播放）"""
         self.ply_path = ply_path
         self.load_ply(ply_path)
-    
+
     def load_ply(self, path):
         """从PLY文件加载高斯点云"""
         frame = GaussianFrame.from_ply(
@@ -2379,23 +2502,211 @@ class GaussianPointCloud:
         )
         self.ply_path = path
         self.apply_frame(frame)
-    
+
+    def export_current_ply(self, path):
+        if self._xyz is None or self._features is None or self._scaling is None or self._rotation is None or self._source_opacity is None:
+            raise RuntimeError("当前没有可导出的高斯点云数据")
+
+        keep_mask = self._visible_mask() if self._edit_state is not None else np.ones((self._point_count,), dtype=bool)
+        if keep_mask.size == 0 or not np.any(keep_mask):
+            raise RuntimeError("当前没有可导出的可见高斯")
+
+        xyz = self._xyz.detach().cpu().numpy()[keep_mask]
+        features = self._features.detach().cpu().numpy()[keep_mask]
+        scaling = self._scaling.detach().cpu().numpy()[keep_mask]
+        rotation = self._rotation.detach().cpu().numpy()[keep_mask]
+        opacity = self._source_opacity.detach().cpu().numpy()[keep_mask]
+
+        opacity = np.clip(opacity, 1e-6, 1.0 - 1e-6)
+        opacity_raw = np.log(opacity / (1.0 - opacity)).reshape(-1)
+        scale_raw = np.log(np.clip(scaling, 1e-12, None))
+        features_dc = features[:, 0, :]
+        features_rest = np.transpose(features[:, 1:, :], (0, 2, 1)).reshape(features.shape[0], -1)
+
+        dtype_fields = [
+            ("x", "f4"), ("y", "f4"), ("z", "f4"),
+            ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
+            ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),
+        ]
+        dtype_fields.extend((f"f_rest_{i}", "f4") for i in range(features_rest.shape[1]))
+        dtype_fields.append(("opacity", "f4"))
+        dtype_fields.extend((f"scale_{i}", "f4") for i in range(scale_raw.shape[1]))
+        dtype_fields.extend((f"rot_{i}", "f4") for i in range(rotation.shape[1]))
+
+        vertex = np.empty(xyz.shape[0], dtype=dtype_fields)
+        vertex["x"] = xyz[:, 0]
+        vertex["y"] = xyz[:, 1]
+        vertex["z"] = xyz[:, 2]
+        vertex["nx"] = 0.0
+        vertex["ny"] = 0.0
+        vertex["nz"] = 0.0
+        vertex["f_dc_0"] = features_dc[:, 0]
+        vertex["f_dc_1"] = features_dc[:, 1]
+        vertex["f_dc_2"] = features_dc[:, 2]
+        for i in range(features_rest.shape[1]):
+            vertex[f"f_rest_{i}"] = features_rest[:, i]
+        vertex["opacity"] = opacity_raw
+        for i in range(scale_raw.shape[1]):
+            vertex[f"scale_{i}"] = scale_raw[:, i]
+        for i in range(rotation.shape[1]):
+            vertex[f"rot_{i}"] = rotation[:, i]
+
+        ply = PlyData([PlyElement.describe(vertex, "vertex")], text=False)
+        ply.write(path)
+
+    def clear_selection(self):
+        if self._edit_state is None:
+            return 0
+        selected = self._selected_mask()
+        count = int(selected.sum())
+        if count > 0:
+            self._edit_state[selected] &= ~self.STATE_SELECTED
+            self._mark_state_changed(refresh_visibility=False)
+        return count
+
+    def select_all(self):
+        if self._edit_state is None:
+            return 0
+        visible = self._visible_mask()
+        count = int(visible.sum())
+        if count > 0:
+            self._edit_state[visible] |= self.STATE_SELECTED
+            self._mark_state_changed(refresh_visibility=False)
+        return count
+
+    def invert_selection(self):
+        if self._edit_state is None:
+            return 0
+        visible = self._visible_mask()
+        if not np.any(visible):
+            return 0
+        self._edit_state[visible] ^= self.STATE_SELECTED
+        self._mark_state_changed(refresh_visibility=False)
+        return int(self.selection_count)
+
+    def apply_selection_indices(self, indices, op="set"):
+        if self._edit_state is None:
+            return 0
+        indices = self._sanitize_indices(indices)
+        visible = self._visible_mask()
+        if op == "set":
+            self._edit_state[visible] &= ~self.STATE_SELECTED
+            if indices.size > 0:
+                self._edit_state[indices] |= self.STATE_SELECTED
+        elif op == "add":
+            if indices.size > 0:
+                self._edit_state[indices] |= self.STATE_SELECTED
+        elif op == "remove":
+            if indices.size > 0:
+                self._edit_state[indices] &= ~self.STATE_SELECTED
+        else:
+            raise ValueError(f"Unsupported selection op: {op}")
+        self._mark_state_changed(refresh_visibility=False)
+        return int(self.selection_count)
+
+    def hide_selected(self):
+        if self._edit_state is None:
+            return 0
+        selected = self._selected_mask() & self._visible_mask()
+        count = int(selected.sum())
+        if count > 0:
+            self._edit_state[selected] |= self.STATE_HIDDEN
+            self._edit_state[selected] &= ~self.STATE_SELECTED
+            self._mark_state_changed(refresh_visibility=True)
+        return count
+
+    def unhide_all(self):
+        if self._edit_state is None:
+            return 0
+        hidden = (self._edit_state & self.STATE_HIDDEN) != 0
+        count = int(hidden.sum())
+        if count > 0:
+            self._edit_state[hidden] &= ~self.STATE_HIDDEN
+            self._mark_state_changed(refresh_visibility=True)
+        return count
+
+    def delete_selected(self):
+        if self._edit_state is None:
+            return 0
+        selected = self._selected_mask() & self._visible_mask()
+        count = int(selected.sum())
+        if count > 0:
+            self._edit_state[selected] |= self.STATE_DELETED
+            self._edit_state[selected] &= ~self.STATE_SELECTED
+            self._mark_state_changed(refresh_visibility=True)
+        return count
+
+    def restore_deleted(self):
+        if self._edit_state is None:
+            return 0
+        deleted = (self._edit_state & self.STATE_DELETED) != 0
+        count = int(deleted.sum())
+        if count > 0:
+            self._edit_state[deleted] &= ~self.STATE_DELETED
+            self._mark_state_changed(refresh_visibility=True)
+        return count
+
+    def get_state_mask(self, device=None):
+        if self._edit_state is None:
+            return None
+        tensor = torch.from_numpy(self._edit_state)
+        if device is not None:
+            tensor = tensor.to(device=device, non_blocking=(str(device) != "cpu"))
+        return tensor
+
+    def get_selected_indices(self):
+        if self._edit_state is None:
+            return np.empty((0,), dtype=np.int64)
+        return np.flatnonzero(self._selected_mask()).astype(np.int64, copy=False)
+
+    @property
+    def selection_count(self):
+        if self._edit_state is None:
+            return 0
+        return int(self._selected_mask().sum())
+
+    @property
+    def visible_count(self):
+        if self._edit_state is None:
+            return 0
+        return int(self._visible_mask().sum())
+
+    @property
+    def hidden_count(self):
+        if self._edit_state is None:
+            return 0
+        return int(((self._edit_state & self.STATE_HIDDEN) != 0).sum())
+
+    @property
+    def deleted_count(self):
+        if self._edit_state is None:
+            return 0
+        return int(((self._edit_state & self.STATE_DELETED) != 0).sum())
+
+    @property
+    def edit_state_version(self):
+        return int(self._edit_state_version)
+
     @property
     def get_xyz(self):
         return self._xyz
-    
+
     @property
     def get_scaling(self):
         return self._scaling
-    
+
     @property
     def get_rotation(self):
         return self._rotation
-    
+
     @property
     def get_opacity(self):
         return self._opacity
-    
+
+    @property
+    def get_source_opacity(self):
+        return self._source_opacity if self._source_opacity is not None else self._opacity
+
     @property
     def get_features(self):
         return self._features
@@ -2783,6 +3094,170 @@ class GaussianRenderer:
         else:
             self._means2d_buffer.zero_()
         return self._means2d_buffer
+
+    def _pick_scale_factor(self):
+        if self.render_mode == self.RENDER_MODE_SPLAT:
+            return 1.0
+        return max(0.1, float(self.point_size))
+
+    def _project_gaussians(self, camera, indices=None):
+        xyz = self.pc.get_xyz
+        scaling = self.pc.get_scaling
+        if xyz is None or xyz.numel() == 0:
+            return None
+
+        device = xyz.device
+        if indices is None:
+            base_indices = torch.arange(xyz.shape[0], device=device, dtype=torch.long)
+        else:
+            if isinstance(indices, torch.Tensor):
+                base_indices = indices.to(device=device, dtype=torch.long)
+            else:
+                base_indices = torch.as_tensor(indices, device=device, dtype=torch.long)
+            if base_indices.numel() == 0:
+                return None
+            xyz = xyz.index_select(0, base_indices)
+            scaling = scaling.index_select(0, base_indices)
+
+        state = self.pc.get_state_mask(device=device)
+        if state is None:
+            visible_mask = torch.ones((xyz.shape[0],), dtype=torch.bool, device=device)
+        else:
+            if indices is not None:
+                state = state.index_select(0, base_indices)
+            visible_mask = (state & (GaussianPointCloud.STATE_HIDDEN | GaussianPointCloud.STATE_DELETED)) == 0
+
+        right = torch.as_tensor(camera.R[:, 0], dtype=torch.float32, device=device)
+        down = torch.as_tensor(camera.R[:, 1], dtype=torch.float32, device=device)
+        forward = torch.as_tensor(camera.R[:, 2], dtype=torch.float32, device=device)
+        position = torch.as_tensor(camera.position, dtype=torch.float32, device=device)
+
+        rel = xyz - position.unsqueeze(0)
+        cam_x = rel @ right
+        cam_y = rel @ down
+        cam_z = rel @ forward
+
+        tan_half_x = math.tan(camera.FoVx * 0.5)
+        tan_half_y = math.tan(camera.FoVy * 0.5)
+        focal_x = camera.width / max(1e-6, 2.0 * tan_half_x)
+        focal_y = camera.height / max(1e-6, 2.0 * tan_half_y)
+
+        safe_z = cam_z.clamp_min(max(camera.znear, 1e-4))
+        screen_x = cam_x * (focal_x / safe_z) + camera.width * 0.5
+        screen_y = cam_y * (focal_y / safe_z) + camera.height * 0.5
+
+        scale_mul = self._pick_scale_factor()
+        radii = torch.amax(scaling, dim=1) * max(focal_x, focal_y) * scale_mul * 2.5 / safe_z
+        radii = radii.clamp(min=1.5, max=max(camera.width, camera.height) * 0.25)
+
+        valid = visible_mask & (cam_z > max(camera.znear, 1e-4))
+        valid &= screen_x >= -radii
+        valid &= screen_x <= (camera.width + radii)
+        valid &= screen_y >= -radii
+        valid &= screen_y <= (camera.height + radii)
+
+        return {
+            "indices": base_indices,
+            "screen_x": screen_x,
+            "screen_y": screen_y,
+            "depth": cam_z,
+            "radius": radii,
+            "valid": valid,
+        }
+
+    def pick_point(self, camera, norm_x, norm_y, min_pick_radius=6.0, fallback_radius=14.0):
+        with torch.inference_mode():
+            projected = self._project_gaussians(camera)
+            if projected is None:
+                return None
+
+            valid = projected["valid"]
+            if not bool(valid.any().item()):
+                return None
+
+            px = float(norm_x) * camera.width
+            py = float(norm_y) * camera.height
+            dx = projected["screen_x"] - px
+            dy = projected["screen_y"] - py
+            dist2 = dx * dx + dy * dy
+            eff_radius = torch.clamp(projected["radius"], min=float(min_pick_radius))
+
+            hits = valid & (dist2 <= eff_radius * eff_radius)
+            if not bool(hits.any().item()):
+                hits = valid & (dist2 <= float(fallback_radius) ** 2)
+                if not bool(hits.any().item()):
+                    return None
+
+            candidate_idx = torch.nonzero(hits, as_tuple=False).squeeze(1)
+            if candidate_idx.numel() == 1:
+                best = candidate_idx[0]
+            else:
+                depth = projected["depth"].index_select(0, candidate_idx)
+                radius2 = eff_radius.index_select(0, candidate_idx).pow(2).clamp_min(1e-6)
+                pick_score = depth / depth.max().clamp_min(1e-6)
+                pick_score = pick_score + 0.15 * dist2.index_select(0, candidate_idx) / radius2
+                best = candidate_idx[torch.argmin(pick_score)]
+            return int(projected["indices"][best].item())
+
+    def pick_rect(self, camera, start_norm, end_norm):
+        with torch.inference_mode():
+            projected = self._project_gaussians(camera)
+            if projected is None:
+                return np.empty((0,), dtype=np.int64)
+
+            x0 = min(float(start_norm[0]), float(end_norm[0])) * camera.width
+            x1 = max(float(start_norm[0]), float(end_norm[0])) * camera.width
+            y0 = min(float(start_norm[1]), float(end_norm[1])) * camera.height
+            y1 = max(float(start_norm[1]), float(end_norm[1])) * camera.height
+
+            hits = projected["valid"]
+            hits &= projected["screen_x"] >= x0
+            hits &= projected["screen_x"] <= x1
+            hits &= projected["screen_y"] >= y0
+            hits &= projected["screen_y"] <= y1
+            if not bool(hits.any().item()):
+                return np.empty((0,), dtype=np.int64)
+
+            return (
+                projected["indices"]
+                .index_select(0, torch.nonzero(hits, as_tuple=False).squeeze(1))
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.int64, copy=False)
+            )
+
+    def get_selection_overlay(self, camera, max_points=1024):
+        selected = self.pc.get_selected_indices()
+        if selected.size == 0:
+            return []
+
+        device = self._device()
+        indices = torch.as_tensor(selected, device=device, dtype=torch.long)
+        if indices.numel() > int(max_points):
+            sample_ids = torch.linspace(
+                0,
+                indices.numel() - 1,
+                steps=int(max_points),
+                device=device,
+            ).long()
+            indices = indices.index_select(0, sample_ids)
+
+        with torch.inference_mode():
+            projected = self._project_gaussians(camera, indices=indices)
+            if projected is None:
+                return []
+            valid = projected["valid"]
+            if not bool(valid.any().item()):
+                return []
+
+            xs = projected["screen_x"][valid].detach().cpu().numpy()
+            ys = projected["screen_y"][valid].detach().cpu().numpy()
+            rs = projected["radius"][valid].clamp(3.0, 14.0).detach().cpu().numpy()
+            return [
+                (float(x), float(y), float(r))
+                for x, y, r in zip(xs.tolist(), ys.tolist(), rs.tolist())
+            ]
         
     def _render_gaussians(self, camera, resolution_scale=1.0):
         with torch.inference_mode():

@@ -32,6 +32,7 @@ class ViewportOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setStyleSheet("background: transparent;")
+        self._selection_enabled = False
 
         # We don't use a layout for self — children are positioned absolutely
         self._margin = 12
@@ -85,10 +86,7 @@ class ViewportOverlay(QWidget):
             f"background: rgba(10,17,24,0.6); color: {C_TEXT2}; "
             f"border-radius: {S(8)}px; padding: {S(6)}px {S(10)}px; font-size: {F_CAPTION()}px;"
         )
-        self.shortcuts_label.setText(
-            "拖动: 旋转  |  右键/中键: 平移  |  滚轮: 缩放\n"
-            "Space: 播放  |  G: 显示  |  Tab: 面板  |  H: HUD"
-        )
+        self.shortcuts_label.setText(self._shortcuts_text())
         self.shortcuts_label.adjustSize()
 
     def _build_hud_label(self, parent):
@@ -135,10 +133,18 @@ class ViewportOverlay(QWidget):
         vis_str = vis_labels.get(vis_mode, vis_mode)
         self.scene_label.setText(f"{scene_name}  |  {vis_str}  |  {camera_mode}")
         self.scene_label.adjustSize()
+        self._reposition_if_possible()
 
     def update_hud(self, fps: float, frame_str: str, cache_str: str):
-        self.hud_label.setText(f"FPS {fps:.0f}  |  {frame_str}  |  {cache_str}")
+        selection_text = ""
+        if self.state.selected_gaussians > 0 or self.state.selection_mode:
+            selection_text = (
+                f"  |  Sel {self.state.selected_gaussians}"
+                f" / Vis {self.state.visible_gaussians}"
+            )
+        self.hud_label.setText(f"FPS {fps:.0f}  |  {frame_str}  |  {cache_str}{selection_text}")
         self.hud_label.adjustSize()
+        self._reposition_if_possible()
 
     def sync_vis_mode(self, mode_key: str):
         self.state.vis_mode = mode_key
@@ -150,6 +156,12 @@ class ViewportOverlay(QWidget):
 
     def set_shortcuts_visible(self, visible: bool):
         self.shortcuts_label.setVisible(visible)
+
+    def set_selection_mode(self, enabled: bool):
+        self._selection_enabled = bool(enabled)
+        self.shortcuts_label.setText(self._shortcuts_text())
+        self.shortcuts_label.adjustSize()
+        self._reposition_if_possible()
 
     def set_all_visible(self, visible: bool):
         self.scene_label.setVisible(visible)
@@ -168,3 +180,19 @@ class ViewportOverlay(QWidget):
     def _on_capsule_clicked(self, mode_key: str):
         self.quick_vis_mode_clicked.emit(mode_key)
         self._sync_capsules()
+
+    def _shortcuts_text(self) -> str:
+        if self._selection_enabled:
+            return (
+                "左键: 点选  |  左键拖拽: 框选  |  Shift: 添加  |  Ctrl: 移除\n"
+                "Delete: 删除  |  Shift+H: 隐藏  |  V: 退出选择"
+            )
+        return (
+            "拖动: 旋转  |  右键/中键: 平移  |  滚轮: 缩放\n"
+            "Space: 播放  |  G: 显示  |  V: 选择  |  Tab: 面板"
+        )
+
+    def _reposition_if_possible(self):
+        parent = self.parentWidget()
+        if parent is not None:
+            self.reposition(parent.width(), parent.height())

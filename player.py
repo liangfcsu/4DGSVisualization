@@ -161,13 +161,20 @@ class RenderView(QWidget):
         self._scaled_pixmap: QPixmap | None = None
         self._scaled_size: QSize | None = None
         self._scaled_key = None
+        self._image_rect = None
         self._interaction_callback = None
+        self._selection_callback = None
 
         self._left  = False
         self._right = False
         self._mid   = False
         self._last_pos = None
         self._trackball_ratio = 0.75
+        self._selection_mode = False
+        self._selection_drag = False
+        self._selection_start = None
+        self._selection_current = None
+        self._selection_overlay_points = []
 
         # Overlay references (set by MainWindow)
         self._overlay = None
@@ -178,6 +185,21 @@ class RenderView(QWidget):
 
     def set_interaction_callback(self, callback):
         self._interaction_callback = callback
+
+    def set_selection_callback(self, callback):
+        self._selection_callback = callback
+
+    def set_selection_mode(self, enabled: bool):
+        self._selection_mode = bool(enabled)
+        self._selection_drag = False
+        self._selection_start = None
+        self._selection_current = None
+        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        self.update()
+
+    def set_selection_overlay_points(self, points):
+        self._selection_overlay_points = list(points or [])
+        self.update()
 
     def is_interacting(self):
         return self._left or self._right or self._mid
@@ -194,9 +216,10 @@ class RenderView(QWidget):
         self.update()
 
     def paintEvent(self, event):
-        from PyQt5.QtGui import QPainter
+        from PyQt5.QtGui import QPainter, QPen
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(0, 0, 0))
+        self._image_rect = None
         if self._pixmap:
             pixmap_key = self._pixmap.cacheKey()
             target_size = self.size()
@@ -213,7 +236,33 @@ class RenderView(QWidget):
             scaled = self._scaled_pixmap
             x = (self.width()  - scaled.width())  // 2
             y = (self.height() - scaled.height()) // 2
+            self._image_rect = (x, y, scaled.width(), scaled.height())
             painter.drawPixmap(x, y, scaled)
+
+        if self._image_rect and self._selection_overlay_points:
+            x0, y0, w, h = self._image_rect
+            sx = w / max(1, self.render_width())
+            sy = h / max(1, self.render_height())
+            pen = QPen(QColor(255, 167, 38, 220))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            for px, py, radius in self._selection_overlay_points:
+                cx = x0 + px * sx
+                cy = y0 + py * sy
+                rr = max(3.0, radius * 0.6 * min(sx, sy))
+                painter.drawEllipse(int(cx - rr), int(cy - rr), int(rr * 2), int(rr * 2))
+
+        if self._selection_drag and self._selection_start and self._selection_current:
+            pen = QPen(QColor(255, 110, 64, 240))
+            pen.setWidth(2)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QColor(255, 110, 64, 40))
+            x0 = min(self._selection_start[0], self._selection_current[0])
+            y0 = min(self._selection_start[1], self._selection_current[1])
+            w = abs(self._selection_start[0] - self._selection_current[0])
+            h = abs(self._selection_start[1] - self._selection_current[1])
+            painter.drawRect(int(x0), int(y0), int(w), int(h))
 
     def resizeEvent(self, event):
         self._scaled_pixmap = None
@@ -231,8 +280,64 @@ class RenderView(QWidget):
         r = min(self.width(), self.height()) / 2 * self._trackball_ratio
         return (pos.x() - cx) ** 2 + (pos.y() - cy) ** 2 < r * r
 
+    def render_width(self):
+        if self.camera:
+            return max(1, int(self.camera.width))
+        return max(1, self.width())
+
+    def render_height(self):
+        if self.camera:
+            return max(1, int(self.camera.height))
+        return max(1, self.height())
+
+    def _clamp_to_image_rect(self, pos):
+        if not self._image_rect:
+            return None
+        x0, y0, w, h = self._image_rect
+        px = min(max(pos.x(), x0), x0 + w)
+        py = min(max(pos.y(), y0), y0 + h)
+        return (px, py)
+
+    def _point_inside_image(self, pos):
+        if not self._image_rect:
+            return False
+        x0, y0, w, h = self._image_rect
+        return x0 <= pos.x() <= x0 + w and y0 <= pos.y() <= y0 + h
+
+    def _widget_point_to_norm(self, point):
+        if not self._image_rect:
+            return None
+        x0, y0, w, h = self._image_rect
+        px = min(max(point[0], x0), x0 + w)
+        py = min(max(point[1], y0), y0 + h)
+        return (
+            (px - x0) / max(1.0, float(w)),
+            (py - y0) / max(1.0, float(h)),
+        )
+
+    def _selection_op(self, modifiers):
+        if modifiers & Qt.ShiftModifier:
+            return "add"
+        if modifiers & Qt.ControlModifier:
+            return "remove"
+        return "set"
+
     def mousePressEvent(self, e):
         if not self.camera:
+            return
+        if (
+            self._selection_mode
+            and e.button() == Qt.LeftButton
+            and self._selection_callback
+            and self._point_inside_image(e.pos())
+        ):
+            self._selection_drag = True
+            self._selection_start = self._clamp_to_image_rect(e.pos())
+            self._selection_current = self._selection_start
+            self._last_pos = None
+            self.setFocus()
+            self.update()
+            e.accept()
             return
         b = e.button()
         if   b == Qt.LeftButton:   self._left  = True
@@ -244,6 +349,28 @@ class RenderView(QWidget):
             self._interaction_callback()
 
     def mouseReleaseEvent(self, e):
+        if self._selection_drag and e.button() == Qt.LeftButton:
+            start = self._selection_start
+            end = self._clamp_to_image_rect(e.pos()) or self._selection_current
+            self._selection_drag = False
+            self._selection_start = None
+            self._selection_current = None
+            self.update()
+            if start and end and self._selection_callback:
+                dx = end[0] - start[0]
+                dy = end[1] - start[1]
+                op = self._selection_op(e.modifiers())
+                if abs(dx) < 4 and abs(dy) < 4:
+                    point_norm = self._widget_point_to_norm(end)
+                    if point_norm is not None:
+                        self._selection_callback("point", op, point_norm)
+                else:
+                    start_norm = self._widget_point_to_norm(start)
+                    end_norm = self._widget_point_to_norm(end)
+                    if start_norm is not None and end_norm is not None:
+                        self._selection_callback("rect", op, (start_norm, end_norm))
+            e.accept()
+            return
         b = e.button()
         if   b == Qt.LeftButton:   self._left  = False
         elif b == Qt.RightButton:  self._right = False
@@ -254,6 +381,11 @@ class RenderView(QWidget):
             self._interaction_callback()
 
     def mouseMoveEvent(self, e):
+        if self._selection_drag:
+            self._selection_current = self._clamp_to_image_rect(e.pos()) or self._selection_current
+            self.update()
+            e.accept()
+            return
         if not self.camera or self._last_pos is None:
             return
         dx = e.pos().x() - self._last_pos.x()
@@ -375,9 +507,31 @@ class MainWindow(QMainWindow):
         fm = mb.addMenu("文件(&F)")
         a = QAction("截图 (&M)", self); a.setShortcut("M"); a.triggered.connect(self._screenshot)
         fm.addAction(a)
+        a = QAction("导出当前编辑帧 PLY", self); a.triggered.connect(self._export_current_frame_ply)
+        fm.addAction(a)
         fm.addSeparator()
         a = QAction("退出 (&Q)", self); a.setShortcut("Ctrl+Q"); a.triggered.connect(self.close)
         fm.addAction(a)
+
+        em = mb.addMenu("编辑(&E)")
+        a = QAction("选择模式 (&V)", self); a.setShortcut("V"); a.triggered.connect(self._toggle_selection_mode)
+        em.addAction(a)
+        em.addSeparator()
+        a = QAction("全选", self); a.setShortcut("Ctrl+A"); a.triggered.connect(self._select_all)
+        em.addAction(a)
+        a = QAction("清空选择", self); a.setShortcut("Ctrl+Shift+A"); a.triggered.connect(self._clear_selection)
+        em.addAction(a)
+        a = QAction("反选", self); a.setShortcut("Ctrl+I"); a.triggered.connect(self._invert_selection)
+        em.addAction(a)
+        em.addSeparator()
+        a = QAction("隐藏选中", self); a.setShortcut("Shift+H"); a.triggered.connect(self._hide_selected)
+        em.addAction(a)
+        a = QAction("恢复隐藏", self); a.setShortcut("Shift+U"); a.triggered.connect(self._unhide_all)
+        em.addAction(a)
+        a = QAction("删除选中", self); a.setShortcut("Delete"); a.triggered.connect(self._delete_selected)
+        em.addAction(a)
+        a = QAction("恢复删除", self); a.setShortcut("Shift+R"); a.triggered.connect(self._restore_deleted)
+        em.addAction(a)
 
         vm = mb.addMenu("视图(&V)")
         for label, w, h in RESOLUTION_OPTIONS:
@@ -435,6 +589,7 @@ class MainWindow(QMainWindow):
         self.view = RenderView()
         self.view.set_camera(self.camera)
         self.view.set_interaction_callback(self._request_render)
+        self.view.set_selection_callback(self._handle_view_selection)
         middle_hl.addWidget(self.view, stretch=1)
 
         # Right toggle button (visible when panel hidden)
@@ -481,6 +636,13 @@ class MainWindow(QMainWindow):
         self.top_bar.sync_camera_mode(self.ui_state.camera_mode)
         self.left_panel.sync_resolution(self.render_w, self.render_h)
         self.left_panel.sync_point_size(self.ui_state.point_size)
+        self.left_panel.sync_selection_mode(self.ui_state.selection_mode)
+        self.left_panel.sync_selection_stats(
+            self.pc.selection_count,
+            self.pc.visible_count,
+            self.pc.hidden_count,
+            self.pc.deleted_count,
+        )
         # Sync camera params
         self.left_panel.move_speed_spin.blockSignals(True)
         self.left_panel.move_speed_spin.setValue(self.camera.move_speed)
@@ -491,9 +653,12 @@ class MainWindow(QMainWindow):
         if self.seq:
             self.bottom_bar.sync_loop(self.ui_state.loop_enabled)
         self.overlay.sync_vis_mode(self.ui_state.vis_mode)
+        self.overlay.set_selection_mode(self.ui_state.selection_mode)
+        cam_label = dict((k, l) for l, k in CAMERA_MODES).get(self.ui_state.camera_mode, "Free")
         self.overlay.update_scene_label(
-            self.ui_state.scene_name, self.ui_state.vis_mode, self.ui_state.camera_mode
+            self.ui_state.scene_name, self.ui_state.vis_mode, cam_label
         )
+        self.view.set_selection_mode(self.ui_state.selection_mode)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Signal Connections
@@ -521,6 +686,14 @@ class MainWindow(QMainWindow):
         self.left_panel.move_speed_changed.connect(self._on_move_speed_changed)
         self.left_panel.rot_speed_changed.connect(self._on_rot_speed_changed)
         self.left_panel.reset_camera_clicked.connect(self._reset_camera)
+        self.left_panel.selection_mode_toggled.connect(self._set_selection_mode)
+        self.left_panel.select_all_clicked.connect(self._select_all)
+        self.left_panel.clear_selection_clicked.connect(self._clear_selection)
+        self.left_panel.invert_selection_clicked.connect(self._invert_selection)
+        self.left_panel.hide_selected_clicked.connect(self._hide_selected)
+        self.left_panel.unhide_all_clicked.connect(self._unhide_all)
+        self.left_panel.delete_selected_clicked.connect(self._delete_selected)
+        self.left_panel.restore_deleted_clicked.connect(self._restore_deleted)
 
         # ── Bottom Bar ──
         if self.seq:
@@ -572,6 +745,15 @@ class MainWindow(QMainWindow):
         self._register_shortcut(Qt.Key_N, self._next_camera)
         self._register_shortcut(Qt.Key_P, self._snap_to_nearest_camera)
         self._register_shortcut(Qt.Key_R, self._reset_camera)
+        self._register_shortcut(Qt.Key_V, self._toggle_selection_mode)
+        self._register_shortcut("Ctrl+A", self._select_all)
+        self._register_shortcut("Ctrl+Shift+A", self._clear_selection)
+        self._register_shortcut("Ctrl+I", self._invert_selection)
+        self._register_shortcut("Shift+H", self._hide_selected)
+        self._register_shortcut("Shift+U", self._unhide_all)
+        self._register_shortcut("Delete", self._delete_selected)
+        self._register_shortcut("Backspace", self._delete_selected)
+        self._register_shortcut("Shift+R", self._restore_deleted)
         self._register_shortcut(Qt.Key_Tab, self._toggle_panels)
         self._register_shortcut(Qt.Key_H, self._toggle_hud)
         self._register_shortcut("Ctrl+Return", self._toggle_presentation)
@@ -648,6 +830,10 @@ class MainWindow(QMainWindow):
             )
 
             self.view.update_image(img)
+            self.view.set_selection_overlay_points(
+                self.renderer.get_selection_overlay(self.camera)
+                if self.pc.selection_count > 0 else []
+            )
             self._needs_render = False
             self._update_ui()
 
@@ -698,6 +884,10 @@ class MainWindow(QMainWindow):
         self.ui_state.window_w = self.view.width()
         self.ui_state.window_h = self.view.height()
         self.ui_state.total_gaussians = self.pc.get_xyz.shape[0] if hasattr(self.pc, 'get_xyz') and self.pc.get_xyz is not None else 0
+        self.ui_state.visible_gaussians = self.pc.visible_count
+        self.ui_state.selected_gaussians = self.pc.selection_count
+        self.ui_state.hidden_gaussians = self.pc.hidden_count
+        self.ui_state.deleted_gaussians = self.pc.deleted_count
 
         cache_str = ""
         if self.seq:
@@ -734,6 +924,12 @@ class MainWindow(QMainWindow):
         frame_str = f"Frame {self.ui_state.current_frame}/{self.ui_state.total_frames}" if self.seq else "Static"
         cache_label = f"Cache: {cache_str}" if cache_str else ""
         self.overlay.update_hud(self._fps_avg, frame_str, cache_label)
+        self.left_panel.sync_selection_stats(
+            self.ui_state.selected_gaussians,
+            self.ui_state.visible_gaussians,
+            self.ui_state.hidden_gaussians,
+            self.ui_state.deleted_gaussians,
+        )
 
         # Update right panel (throttled to every 5 frames for performance)
         if self._update_counter % 5 == 0:
@@ -759,7 +955,7 @@ class MainWindow(QMainWindow):
 
         # Status bar (minimal)
         self.statusBar().showMessage(
-            f"{self.render_w}×{self.render_h}  FPS: {self._fps_avg:.0f}"
+            f"{self.render_w}×{self.render_h}  FPS: {self._fps_avg:.0f}  选中: {self.ui_state.selected_gaussians}"
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -768,7 +964,8 @@ class MainWindow(QMainWindow):
 
     def keyPressEvent(self, e):
         k = e.key()
-        if k in CAMERA_MOTION_KEYS:
+        modifiers = e.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
+        if modifiers == Qt.NoModifier and k in CAMERA_MOTION_KEYS:
             self._keys_held.add(k)
             self._request_render()
             e.accept()
@@ -776,7 +973,8 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(e)
 
     def keyReleaseEvent(self, e):
-        if e.key() in CAMERA_MOTION_KEYS:
+        modifiers = e.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
+        if modifiers == Qt.NoModifier and e.key() in CAMERA_MOTION_KEYS:
             self._keys_held.discard(e.key())
             self._request_render()
             e.accept()
@@ -944,6 +1142,92 @@ class MainWindow(QMainWindow):
         self._set_last_event(f"循环播放: {'ON' if enabled else 'OFF'}")
 
     # ═══════════════════════════════════════════════════════════════════════
+    # Actions — Selection
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _set_selection_mode(self, enabled: bool):
+        enabled = bool(enabled)
+        self.ui_state.selection_mode = enabled
+        self.left_panel.sync_selection_mode(enabled)
+        self.overlay.set_selection_mode(enabled)
+        self.view.set_selection_mode(enabled)
+        self._set_last_event(f"选择模式: {'ON' if enabled else 'OFF'}")
+        self.toast.show_message(
+            "选择模式已开启：左键点选 / 拖拽框选 / Shift添加 / Ctrl移除"
+            if enabled else "选择模式已关闭",
+            1800,
+        )
+        self._request_render()
+
+    def _toggle_selection_mode(self):
+        self._set_selection_mode(not self.ui_state.selection_mode)
+
+    def _selection_summary_text(self):
+        return (
+            f"已选 {self.pc.selection_count} / 可见 {self.pc.visible_count} / "
+            f"隐藏 {self.pc.hidden_count} / 删除 {self.pc.deleted_count}"
+        )
+
+    def _apply_selection_feedback(self, prefix: str):
+        summary = self._selection_summary_text()
+        self._set_last_event(f"{prefix} · {summary}")
+        self.toast.show_message(f"{prefix} · {summary}", 1800)
+        self._request_render()
+
+    def _handle_view_selection(self, kind: str, op: str, payload):
+        if kind == "point":
+            idx = self.renderer.pick_point(self.camera, payload[0], payload[1])
+            indices = [] if idx is None else [idx]
+            action_label = "点选"
+        else:
+            start_norm, end_norm = payload
+            indices = self.renderer.pick_rect(self.camera, start_norm, end_norm)
+            action_label = "框选"
+        self.pc.apply_selection_indices(indices, op=op)
+        op_label = {"set": "设置", "add": "添加", "remove": "移除"}.get(op, op)
+        self._apply_selection_feedback(f"{action_label}{op_label}")
+
+    def _clear_selection(self):
+        self.pc.clear_selection()
+        self._apply_selection_feedback("清空选择")
+
+    def _select_all(self):
+        self.pc.select_all()
+        self._apply_selection_feedback("全选可见高斯")
+
+    def _invert_selection(self):
+        self.pc.invert_selection()
+        self._apply_selection_feedback("反选完成")
+
+    def _hide_selected(self):
+        count = self.pc.hide_selected()
+        if count <= 0:
+            self.toast.show_message("当前没有可隐藏的选中高斯", 1500)
+            return
+        self._apply_selection_feedback(f"已隐藏 {count} 个高斯")
+
+    def _unhide_all(self):
+        count = self.pc.unhide_all()
+        if count <= 0:
+            self.toast.show_message("当前没有隐藏的高斯", 1500)
+            return
+        self._apply_selection_feedback(f"已恢复 {count} 个隐藏高斯")
+
+    def _delete_selected(self):
+        count = self.pc.delete_selected()
+        if count <= 0:
+            self.toast.show_message("当前没有可删除的选中高斯", 1500)
+            return
+        self._apply_selection_feedback(f"已删除 {count} 个高斯")
+
+    def _restore_deleted(self):
+        count = self.pc.restore_deleted()
+        if count <= 0:
+            self.toast.show_message("当前没有删除的高斯", 1500)
+            return
+        self._apply_selection_feedback(f"已恢复 {count} 个删除高斯")
+
+    # ═══════════════════════════════════════════════════════════════════════
     # Actions — Playback
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -1054,6 +1338,25 @@ class MainWindow(QMainWindow):
         self.toast.show_message(f"截图已保存: {fname} ({w}×{h})", 3000)
         print(f"截图已保存: {fname}  ({w}×{h})")
 
+    def _export_current_frame_ply(self):
+        scene_base = self._scene_name().replace(os.sep, "_")
+        default_name = f"{scene_base}_edited.ply"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出当前编辑后的 PLY",
+            default_name,
+            "PLY Files (*.ply)",
+        )
+        if not file_path:
+            return
+        try:
+            self.pc.export_current_ply(file_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", f"无法导出当前编辑帧:\n{exc}")
+            return
+        self._set_last_event(f"导出PLY: {os.path.basename(file_path)}")
+        self.toast.show_message(f"已导出编辑后的 PLY: {os.path.basename(file_path)}", 2500)
+
     # ═══════════════════════════════════════════════════════════════════════
     # Helpers
     # ═══════════════════════════════════════════════════════════════════════
@@ -1117,6 +1420,14 @@ class MainWindow(QMainWindow):
 <b>鼠标操作 (Trackball 模式)</b><br>
 &nbsp;&nbsp;<b>左键中心</b> — 球面旋转 &nbsp; <b>左键边缘</b> — 滚转<br>
 &nbsp;&nbsp;<b>右键中心</b> — 平移 &nbsp; <b>右键边缘</b> — 缩放<br><br>
+
+<b>高斯选择 / 编辑</b><br>
+&nbsp;&nbsp;<b>V</b> — 开关选择模式<br>
+&nbsp;&nbsp;<b>左键单击</b> — 点选高斯 &nbsp; <b>左键拖拽</b> — 框选高斯<br>
+&nbsp;&nbsp;<b>Shift</b> — 添加到选择 &nbsp; <b>Ctrl</b> — 从选择中移除<br>
+&nbsp;&nbsp;<b>Ctrl+A</b> — 全选 &nbsp; <b>Ctrl+Shift+A</b> — 清空选择 &nbsp; <b>Ctrl+I</b> — 反选<br>
+&nbsp;&nbsp;<b>Delete</b> — 删除选中 &nbsp; <b>Shift+H</b> — 隐藏选中<br>
+&nbsp;&nbsp;<b>Shift+U</b> — 恢复隐藏 &nbsp; <b>Shift+R</b> — 恢复删除<br><br>
 
 <b>相机移动</b><br>
 &nbsp;&nbsp;<b>W/S</b> 前后 &nbsp; <b>A/D</b> 左右 &nbsp; <b>Q/E</b> 上下<br>

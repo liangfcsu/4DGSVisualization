@@ -72,6 +72,10 @@ class RightInfoPanel(QWidget):
         self._v_camera_mode = self.scene_card.add_row("相机")
         self._v_display_mode = self.scene_card.add_row("显示")
         self._v_total_gauss = self.scene_card.add_row("高斯数")
+        self._v_visible_gauss = self.scene_card.add_row("可见高斯")
+        self._v_selected_gauss = self.scene_card.add_row("选中高斯")
+        self._v_hidden_gauss = self.scene_card.add_row("隐藏高斯")
+        self._v_deleted_gauss = self.scene_card.add_row("删除高斯")
         self._layout.addWidget(self.scene_card)
 
     # ── Performance ───────────────────────────────────────────────────────
@@ -130,6 +134,10 @@ class RightInfoPanel(QWidget):
         self._v_display_mode.setText(vis_label)
         total_g = state.total_gaussians
         self._v_total_gauss.setText(f"{total_g:,}" if total_g > 0 else "—")
+        self._v_visible_gauss.setText(f"{state.visible_gaussians:,}" if state.visible_gaussians > 0 else "0")
+        self._v_selected_gauss.setText(f"{state.selected_gaussians:,}" if state.selected_gaussians > 0 else "0")
+        self._v_hidden_gauss.setText(f"{state.hidden_gaussians:,}" if state.hidden_gaussians > 0 else "0")
+        self._v_deleted_gauss.setText(f"{state.deleted_gaussians:,}" if state.deleted_gaussians > 0 else "0")
 
         # Performance
         self._v_viewer_fps.setText(f"{state.viewer_fps:.1f}")

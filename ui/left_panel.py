@@ -5,7 +5,7 @@ LeftControlPanel — collapsible parameter groups with only active controls.
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QDoubleSpinBox,
-    QScrollArea, QSizePolicy,
+    QScrollArea, QSizePolicy, QGridLayout,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
@@ -31,6 +31,14 @@ class LeftControlPanel(QWidget):
     move_speed_changed      = pyqtSignal(float)
     rot_speed_changed       = pyqtSignal(float)
     reset_camera_clicked    = pyqtSignal()
+    selection_mode_toggled  = pyqtSignal(bool)
+    select_all_clicked      = pyqtSignal()
+    clear_selection_clicked = pyqtSignal()
+    invert_selection_clicked = pyqtSignal()
+    hide_selected_clicked   = pyqtSignal()
+    unhide_all_clicked      = pyqtSignal()
+    delete_selected_clicked = pyqtSignal()
+    restore_deleted_clicked = pyqtSignal()
 
     def __init__(self, state: UIState, cameras_info=None, parent=None):
         super().__init__(parent)
@@ -75,6 +83,7 @@ class LeftControlPanel(QWidget):
 
         self._build_display_section()
         self._build_gaussian_section()
+        self._build_selection_section()
         self._build_camera_section()
         self._layout.addStretch()
 
@@ -170,6 +179,47 @@ class LeftControlPanel(QWidget):
         row_ring.addWidget(self.ring_size_spin)
         cl.addLayout(row_ring)
 
+        self._layout.addWidget(sec)
+
+    # ── Selection Section ────────────────────────────────────────────────
+
+    def _build_selection_section(self):
+        sec = CollapsibleSection("Selection", expanded=True)
+        cl = sec.content_layout
+
+        self.selection_mode_btn = QPushButton("启用选择模式")
+        self.selection_mode_btn.setCheckable(True)
+        self.selection_mode_btn.setToolTip("开启后，左键单击可点选，左键拖拽可框选，Shift=添加，Ctrl=移除")
+        self.selection_mode_btn.toggled.connect(self.selection_mode_toggled.emit)
+        cl.addWidget(self.selection_mode_btn)
+
+        self.selection_summary = QLabel("已选 0  |  可见 0  |  隐藏 0  |  删除 0")
+        self.selection_summary.setObjectName("SectionLabel")
+        self.selection_summary.setWordWrap(True)
+        cl.addWidget(self.selection_summary)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(SP_SM())
+        grid.setVerticalSpacing(SP_SM())
+
+        buttons = [
+            ("全选", self.select_all_clicked.emit, "选择全部可见高斯 (Ctrl+A)"),
+            ("清空", self.clear_selection_clicked.emit, "清空当前选择 (Ctrl+Shift+A)"),
+            ("反选", self.invert_selection_clicked.emit, "反转当前可见高斯的选择状态 (Ctrl+I)"),
+            ("隐藏选中", self.hide_selected_clicked.emit, "隐藏选中的高斯 (Shift+H)"),
+            ("恢复隐藏", self.unhide_all_clicked.emit, "恢复所有被隐藏的高斯 (Shift+U)"),
+            ("删除选中", self.delete_selected_clicked.emit, "删除选中的高斯 (Delete)"),
+            ("恢复删除", self.restore_deleted_clicked.emit, "恢复所有被删除的高斯 (Shift+R)"),
+        ]
+
+        for idx, (label, callback, tip) in enumerate(buttons):
+            btn = QPushButton(label)
+            btn.setToolTip(tip)
+            btn.clicked.connect(callback)
+            grid.addWidget(btn, idx // 2, idx % 2)
+
+        cl.addLayout(grid)
         self._layout.addWidget(sec)
 
     # ── Camera Section ────────────────────────────────────────────────────
@@ -276,6 +326,17 @@ class LeftControlPanel(QWidget):
         self.point_size_spin.blockSignals(True)
         self.point_size_spin.setValue(val)
         self.point_size_spin.blockSignals(False)
+
+    def sync_selection_mode(self, enabled: bool):
+        self.selection_mode_btn.blockSignals(True)
+        self.selection_mode_btn.setChecked(enabled)
+        self.selection_mode_btn.setText("选择模式已开启" if enabled else "启用选择模式")
+        self.selection_mode_btn.blockSignals(False)
+
+    def sync_selection_stats(self, selected: int, visible: int, hidden: int, deleted: int):
+        self.selection_summary.setText(
+            f"已选 {selected}  |  可见 {visible}  |  隐藏 {hidden}  |  删除 {deleted}"
+        )
 
     # ── Internal ──────────────────────────────────────────────────────────
 

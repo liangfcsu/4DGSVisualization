@@ -69,6 +69,7 @@ class UIState:
         self.point_size: float = 1.0
         self.alpha_scale: float = 1.0
         self.ring_size: float = 0.3
+        self.selection_mode: bool = False
 
         # ── Panel visibility ──
         self.left_panel_visible: bool = True
@@ -88,6 +89,10 @@ class UIState:
         self.window_w: int = 0
         self.window_h: int = 0
         self.total_gaussians: int = 0
+        self.visible_gaussians: int = 0
+        self.selected_gaussians: int = 0
+        self.hidden_gaussians: int = 0
+        self.deleted_gaussians: int = 0
         self.gpu_name: str = ""
         self.cpu_count: int = 0
         self.gpu_memory_used: str = "—"
