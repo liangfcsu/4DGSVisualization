@@ -577,7 +577,9 @@ class MainWindow(QMainWindow):
         em.addAction(a)
         a = QAction("恢复隐藏", self); a.setShortcut("Shift+U"); a.triggered.connect(self._unhide_all)
         em.addAction(a)
-        a = QAction("删除选中", self); a.setShortcut("Del"); a.triggered.connect(self._delete_selected)
+        a = QAction("删除选中", self); a.setShortcut("Delete"); a.triggered.connect(self._delete_selected)
+        em.addAction(a)
+        a = QAction("反向删除（删除未选中）", self); a.setShortcut("Shift+Delete"); a.triggered.connect(self._delete_unselected)
         em.addAction(a)
         a = QAction("恢复删除", self); a.setShortcut("Shift+R"); a.triggered.connect(self._restore_deleted)
         em.addAction(a)
@@ -744,6 +746,7 @@ class MainWindow(QMainWindow):
         self.left_panel.hide_selected_clicked.connect(self._hide_selected)
         self.left_panel.unhide_all_clicked.connect(self._unhide_all)
         self.left_panel.delete_selected_clicked.connect(self._delete_selected)
+        self.left_panel.delete_unselected_clicked.connect(self._delete_unselected)
         self.left_panel.restore_deleted_clicked.connect(self._restore_deleted)
 
         # ── Bottom Bar ──
@@ -803,7 +806,8 @@ class MainWindow(QMainWindow):
         self._register_shortcut("Ctrl+I", self._invert_selection)
         self._register_shortcut("Shift+H", self._hide_selected)
         self._register_shortcut("Shift+U", self._unhide_all)
-        self._register_shortcut("Del", self._delete_selected)
+        self._register_shortcut(Qt.Key_Delete, self._delete_selected)
+        self._register_shortcut("Shift+Delete", self._delete_unselected)
         self._register_shortcut("Shift+R", self._restore_deleted)
         self._register_shortcut(Qt.Key_Tab, self._toggle_panels)
         self._register_shortcut(Qt.Key_H, self._toggle_hud)
@@ -1315,6 +1319,14 @@ class MainWindow(QMainWindow):
             return
         self._apply_selection_feedback(f"已删除 {count} 个高斯")
 
+    def _delete_unselected(self):
+        """反向删除：删除未选中的可见高斯"""
+        count = self.pc.delete_unselected()
+        if count <= 0:
+            self.toast.show_message("当前没有可删除的未选中高斯", 1500)
+            return
+        self._apply_selection_feedback(f"已反向删除 {count} 个高斯（保留选中）")
+
     def _restore_deleted(self):
         count = self.pc.restore_deleted()
         if count <= 0:
@@ -1619,7 +1631,8 @@ class MainWindow(QMainWindow):
 &nbsp;&nbsp;<b>Shift</b> — 添加到选择 &nbsp; <b>Ctrl</b> — 从选择中移除<br>
 &nbsp;&nbsp;<b>框选时按Shift/Ctrl</b> 可在拖拽中修正操作模式<br>
 &nbsp;&nbsp;<b>Ctrl+A</b> — 全选 &nbsp; <b>Ctrl+Shift+A</b> — 清空选择 &nbsp; <b>Ctrl+I</b> — 反选<br>
-&nbsp;&nbsp;<b>Del</b> — 删除选中 &nbsp; <b>Shift+C</b> — 清除持续框 &nbsp; <b>Shift+H</b> — 隐藏选中<br>
+&nbsp;&nbsp;<b>Delete</b> — 删除选中 &nbsp; <b>Shift+Delete</b> — 反向删除（保留选中）<br>
+&nbsp;&nbsp;<b>Shift+C</b> — 清除持续框 &nbsp; <b>Shift+H</b> — 隐藏选中<br>
 &nbsp;&nbsp;<b>Shift+U</b> — 恢复隐藏 &nbsp; <b>Shift+R</b> — 恢复删除<br><br>
 
 <b>相机移动</b><br>

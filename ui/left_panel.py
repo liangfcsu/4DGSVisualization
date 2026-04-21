@@ -39,6 +39,7 @@ class LeftControlPanel(QWidget):
     hide_selected_clicked   = pyqtSignal()
     unhide_all_clicked      = pyqtSignal()
     delete_selected_clicked = pyqtSignal()
+    delete_unselected_clicked = pyqtSignal()
     restore_deleted_clicked = pyqtSignal()
 
     def __init__(self, state: UIState, cameras_info=None, parent=None):
@@ -211,7 +212,8 @@ class LeftControlPanel(QWidget):
             ("反选", self.invert_selection_clicked.emit, "反转当前可见高斯的选择状态 (Ctrl+I)"),
             ("隐藏选中", self.hide_selected_clicked.emit, "隐藏选中的高斯 (Shift+H)"),
             ("恢复隐藏", self.unhide_all_clicked.emit, "恢复所有被隐藏的高斯 (Shift+U)"),
-            ("删除选中", self.delete_selected_clicked.emit, "删除选中的高斯 (Del)"),
+            ("删除选中", self.delete_selected_clicked.emit, "删除选中的高斯 (Delete)"),
+            ("反向删除", self.delete_unselected_clicked.emit, "删除未选中的高斯，保留选中部分 (Shift+Delete)"),
             ("恢复删除", self.restore_deleted_clicked.emit, "恢复所有被删除的高斯 (Shift+R)"),
         ]
 

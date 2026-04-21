@@ -2818,6 +2818,21 @@ class GaussianPointCloud:
             self._mark_state_changed(refresh_visibility=True)
         return count
 
+    def delete_unselected(self):
+        """反向删除：删除未选中的可见高斯，保留选中的高斯"""
+        if self._edit_state is None:
+            return 0
+        visible = self._visible_mask()
+        selected = self._selected_mask()
+        # 计算未选中但可见的高斯
+        unselected_visible = visible & ~selected
+        count = int(unselected_visible.sum())
+        if count > 0:
+            self._accumulate_deleted_transfer_from_indices(np.flatnonzero(unselected_visible))
+            self._edit_state[unselected_visible] |= self.STATE_DELETED
+            self._mark_state_changed(refresh_visibility=True)
+        return count
+
     def restore_deleted(self):
         if self._edit_state is None:
             return 0
